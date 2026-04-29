@@ -2,6 +2,7 @@ import { VersionedTransaction, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { getConnection, getWallet, getBalance } from './wallet.js';
 import { CONFIG } from './config.js';
 import { log } from './logger.js';
+import { logTrade } from './trade-logger.js';
 import { jupiterApi } from './src/jupiter-client.js';
 import { getTokenPriceInSOL } from './price.js';
 
@@ -57,9 +58,17 @@ export async function buyToken(mintAddress, solAmount = CONFIG.BUY_AMOUNT_SOL, p
       await conn.confirmTransaction({ signature: txid, blockhash, lastValidBlockHeight }, 'confirmed');
 
       log('success', `BUY confirmed: ${solAmount} SOL → ${(tokenAmount/1e6).toFixed(2)} tokens`);
-      const newBalance = await getBalance();
-      log('info', `Updated balance after buy: ${newBalance.toFixed(4)} SOL`);
-      return { success: true, txid, tokenAmount, pricePerToken, solSpent: solAmount };
+      logTrade({
+        type: 'buy',
+        mint: mintAddress,
+        solAmount: solAmount,
+        tokenAmount: tokenAmount,
+        pricePerToken: pricePerToken,
+        txid: txid,
+      });
+       const newBalance = await getBalance();
+       log('info', `Updated balance after buy: ${newBalance.toFixed(4)} SOL`);
+       return { success: true, txid, tokenAmount, pricePerToken, solSpent: solAmount };
 
     } catch (err) {
       lastError = err;
@@ -120,7 +129,14 @@ export async function sellToken(mintAddress, tokenAmount, retries = 2) {
       await conn.confirmTransaction(txid, 'confirmed');
 
       log('success', `SELL confirmed: ${solReceived.toFixed(4)} SOL received`);
-      const newBalance = await getBalance();
+      logTrade({
+        type: 'sell',
+        mint: mintAddress,
+        solReceived: solReceived,
+        tokenAmount: tokenAmount,
+        txid: txid,
+      });
+       const newBalance = await getBalance();
       log('info', `Updated balance after sell: ${newBalance.toFixed(4)} SOL`);
       return { success: true, txid, solReceived };
 
