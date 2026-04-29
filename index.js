@@ -110,6 +110,7 @@ async function main() {
 
   monitor   = new PoolMonitor();
   let isBuying = false;
+  let isSwapping = false;
   let buyingTimeout = null;
   const BUY_TIMEOUT_MS = 15000;
 
@@ -137,6 +138,10 @@ async function main() {
 
     if (isBuying) {
       log('warn', `Already buying — skipping`);
+      return;
+    }
+    if (isSwapping) {
+      log('warn', 'Transaction already in progress...');
       return;
     }
     isBuying = true;
@@ -262,6 +267,7 @@ async function main() {
       }
     }
 
+    isSwapping = true;
     try {
       const result = await buyToken(tokenMint, buyAmount, poolId);
 
@@ -283,10 +289,11 @@ async function main() {
         solSpent: result.solSpent,
         pricePerToken: result.pricePerToken,
       });
-      log('success', `Position opened for ${tokenMint.slice(0,8)}...`);
+
     } catch (err) {
-      log('error', `Trade error: ${err.message}`);
+      log('error', `Buy error: ${err.message}`);
     } finally {
+      isSwapping = false;
       resetBuying();
     }
   });
