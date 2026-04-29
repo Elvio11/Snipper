@@ -36,6 +36,11 @@ export const CONFIG = {
   HONEYPOT_CHECK:            process.env.HONEYPOT_CHECK !== 'false',
   MIN_SOL_LIQUIDITY:         parseFloat(process.env.MIN_SOL_LIQUIDITY || '0.5'), // 0.5 SOL minimum
 
+  // Dynamic slippage
+  DYNAMIC_SLIPPAGE:         process.env.DYNAMIC_SLIPPAGE !== 'false',
+  DYNAMIC_SLIPPAGE_MIN_BPS: parseInt(process.env.DYNAMIC_SLIPPAGE_MIN_BPS || '50'),
+  DYNAMIC_SLIPPAGE_MAX_BPS: parseInt(process.env.DYNAMIC_SLIPPAGE_MAX_BPS || '3000'),
+
   // Position controls
   MAX_HOLD_MINUTES:          parseInt(process.env.MAX_HOLD_MINUTES || '15'),      // Force close after 15min
   MONITORING_INTERVAL_MS:      parseInt(process.env.MONITORING_INTERVAL_MS || '3000'),  // 3s high-frequency
