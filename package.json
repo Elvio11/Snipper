@@ -1,0 +1,46 @@
+{
+  "name": "solana-sniper",
+  "version": "1.0.0",
+  "description": "Solana meme token sniper bot - Production",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "start:pm2": "pm2 start ecosystem.config.cjs",
+    "stop:pm2": "pm2 stop sniper",
+    "restart:pm2": "pm2 restart sniper",
+    "logs": "pm2 logs sniper",
+    "logs:err": "pm2 logs sniper --err",
+    "status": "pm2 status",
+    "paper": "node index.js --paper",
+    "dev": "node index.js",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:watch": "vitest watch"
+  },
+  "dependencies": {
+    "@jup-ag/api": "^6.0.48",
+    "@solana/spl-token": "^0.4.9",
+    "@solana/web3.js": "^1.98.4",
+    "bs58": "^6.0.0",
+    "chalk": "^5.3.0",
+    "dotenv": "^16.4.7",
+    "node-telegram-bot-api": "^0.67.0",
+    "winston": "^3.17.0",
+    "winston-daily-rotate-file": "^5.0.0",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.9"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "solana",
+    "sniper",
+    "bot",
+    "trading",
+    "memecoin"
+  ]
+}
