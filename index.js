@@ -126,11 +126,19 @@ async function main() {
   monitor.on('newPool', async (poolInfo) => {
     const { tokenMint, poolId, liquidityUSD } = poolInfo;
 
-    if (positions.count() < CONFIG.MAX_POSITIONS) {
-      log('snipe', `New pool: ${tokenMint.slice(0, 12)}...  Pool: ${poolId.slice(0, 8)}...`);
+    // Guard 1: Max positions check FIRST
+    if (positions.count() >= CONFIG.MAX_POSITIONS) {
+      if (positions.count() < CONFIG.MAX_POSITIONS) {
+        log('snipe', `New pool: ${tokenMint.slice(0, 12)}...  Pool: ${poolId.slice(0, 8)}...`);
+      }
+      log('info', `⚠ Max positions (${CONFIG.MAX_POSITIONS}) — monitoring but NOT buying new tokens`);
+      return;
     }
 
-    // Prevent re-buying existing positions
+    // Log new pool (we're under max)
+    log('snipe', `New pool: ${tokenMint.slice(0, 12)}...  Pool: ${poolId.slice(0, 8)}...`);
+
+    // Guard 2: Prevent re-buying existing positions
     if (positions.get(tokenMint) && positions.get(tokenMint).status === 'open') {
       log('warn', `Already have position for ${tokenMint.slice(0, 8)}... — skipping`);
       return;
@@ -152,9 +160,8 @@ async function main() {
       }
     }, BUY_TIMEOUT_MS);
 
-    if (positions.count() >= CONFIG.MAX_POSITIONS) {
-      log('info', `⚠ Max positions (${CONFIG.MAX_POSITIONS}) — monitoring but NOT buying new tokens`);
-    } else if (!monitor.isListening()) {
+    // Start monitoring if not already
+    if (!monitor.isListening()) {
       await monitor.start();
       log('info', 'Started pool monitoring');
     }
@@ -162,11 +169,6 @@ async function main() {
     const signerBalance = await getSOLBalance();
     const vaultBalance = await getVaultBalance();
     const totalBalance = signerBalance + vaultBalance;
-    
-    if (positions.count() >= CONFIG.MAX_POSITIONS) {
-      log('info', `💰 Balance: ${totalBalance.toFixed(4)} SOL | Max positions reached — still monitoring for opportunities`);
-      return;
-    }
     
     const buyAmount = CONFIG.USE_GRADUATED_SCALING 
       ? getDynamicBuyAmount(totalBalance, CONFIG._solPrice || 90)
