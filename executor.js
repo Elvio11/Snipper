@@ -1,5 +1,5 @@
 import { VersionedTransaction, LAMPORTS_PER_SOL } from '@solana/web3.js';
-import { getConnection, getWallet, getBalance } from './wallet.js';
+import { getConnection, getWallet, getSOLBalance as getBalance } from './wallet.js';
 import { CONFIG } from './config.js';
 import { log } from './logger.js';
 import { logTrade } from './trade-logger.js';

@@ -193,31 +193,35 @@ async function main() {
       return;
     }
     
-    // Check SOL liquidity via Jupiter quote
-    try {
-      const { jupiterApi } = await import('./src/jupiter-client.js');
-      const { LAMPORTS_PER_SOL } = await import('./src/jupiter-client.js');
-      const solQuote = await jupiterApi.quoteGet({
-        inputMint: 'So11111111111111111111111111111111111111112',
-        outputMint: tokenMint,
-        amount: Math.floor(0.001 * LAMPORTS_PER_SOL),
-        slippageBps: 5000,
-      });
-      
-      if (!solQuote || !solQuote.outAmount) {
-        log('warn', `No SOL liquidity route for ${tokenMint.slice(0,8)}... — skipping`);
+    // Check SOL liquidity via Jupiter quote (skip in paper mode)
+    if (!CONFIG.PAPER_TRADING) {
+      try {
+        const { jupiterApi } = await import('./src/jupiter-client.js');
+        const { LAMPORTS_PER_SOL } = await import('./src/jupiter-client.js');
+        const solQuote = await jupiterApi.quoteGet({
+          inputMint: 'So11111111111111111111111111111111111112',
+          outputMint: tokenMint,
+          amount: Math.floor(0.001 * LAMPORTS_PER_SOL),
+          slippageBps: 5000,
+        });
+        
+        if (!solQuote || !solQuote.outAmount) {
+          log('warn', `No SOL liquidity route for ${tokenMint.slice(0,8)}... — skipping`);
+          resetBuying();
+          return;
+        }
+        
+        const tokenReceived = Number(solQuote.outAmount);
+        log('info', `SOL liquidity confirmed: ~${tokenReceived} tokens per 0.001 SOL`);
+      } catch (err) {
+        log('warn', `SOL liquidity check failed: ${err.message}`);
         resetBuying();
         return;
       }
-      
-      const tokenReceived = Number(solQuote.outAmount);
-      log('info', `SOL liquidity confirmed: ~${tokenReceived} tokens per 0.001 SOL`);
-    } catch (err) {
-      log('warn', `SOL liquidity check failed: ${err.message}`);
-      resetBuying();
-      return;
+    } else {
+      log('info', `SOL liquidity check skipped (PAPER_TRADING)`);
     }
-
+    
     // Get price from price.js (with estimated fallback)
     log('info', `Fetching price for ${tokenMint.slice(0,8)}... pool: ${poolId}`);
     let currentPrice = await getTokenPriceInSOL(tokenMint, poolId);

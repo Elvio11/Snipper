@@ -34,10 +34,21 @@ export class PositionManager {
 
       log('warn', `Stale position: ${mint.slice(0,8)}... (${Math.round(age/60000)}m old)`);
 
+      // PAPER MODE: Skip Jupiter API call
+      if (CONFIG.PAPER_TRADING) {
+        pos.status = 'closed';
+        pos.closedAt = Date.now();
+        pos.closeReason = 'stale';
+        pos.pnlSOL = 0;
+        this._save();
+        log('success', `Closed stale position (paper): ${mint.slice(0,8)}...`);
+        continue;
+      }
+
       try {
         const quote = await jupiterApi.quoteGet({
           inputMint: mint,
-          outputMint: 'So11111111111111111111111111111111111111112',
+          outputMint: 'So11111111111111111111111111111111111112',
           amount: Math.floor(pos.tokenAmountOriginal - pos.totalSoldAmount),
           slippageBps: 1000,
         });
