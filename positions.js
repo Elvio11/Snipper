@@ -240,6 +240,14 @@ export class PositionManager {
     
     if (remainingTokens > 0) {
       const result = await sellToken(mintAddress, remainingTokens);
+      
+      // VERIFY SELL SUCCESS BEFORE MARKING CLOSED
+      if (!result.success) {
+        log('error', `Sell failed for ${mintAddress.slice(0,8)}... - keeping position open. Error: ${result.error}`);
+        // Don't close position - keep it open for retry
+        return;
+      }
+      
       const solReceived = result.solReceived || 0;
       // Correct: profit = proceeds - cost basis
       const profitFromRemaining = solReceived - remainingCost;
@@ -254,6 +262,22 @@ export class PositionManager {
   }
 
   async _closeFully(mintAddress, pos, reason) {
+    // Only close if there's no token amount remaining or sell succeeded
+    // If sell fails, keep position open and let monitoring retry
+    
+    if (pos.tokenAmount > 0) {
+      // Try to sell remaining tokens first
+      const result = await sellToken(mintAddress, pos.tokenAmount);
+      
+      if (!result.success) {
+        log('error', `Cannot close position - sell failed: ${result.error}. Position remains open.`);
+        return; // Don't close - keep monitoring
+      }
+      
+      pos.pnlSOL = (pos.pnlSOL || 0) + result.solReceived;
+      log('success', `Position closed with sell: ${result.solReceived.toFixed(4)} SOL`);
+    }
+    
     pos.status = 'closed';
     pos.closeReason = reason;
     pos.closedAt = Date.now();
@@ -289,7 +313,19 @@ export class PositionManager {
       totalPnLSOL: totalPnL.toFixed(4),
       avgWin,
       avgLoss,
+      totalPnL,
     };
+  }
+
+  getTotalClosedPnL() {
+    const all = [...this.positions.values()];
+    const closed = all.filter(p => p.status === 'closed');
+    return closed.reduce((sum, p) => sum + (p.pnlSOL || 0), 0);
+  }
+
+  getClosedPositionsCount() {
+    const all = [...this.positions.values()];
+    return all.filter(p => p.status === 'closed').length;
   }
 
   _load() {
