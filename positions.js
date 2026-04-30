@@ -286,6 +286,22 @@ export class PositionManager {
     this._logTrade(pos);
   }
 
+  async retryFailedCloses() {
+    const openPositions = this.getOpenPositions();
+    let retried = 0;
+    
+    for (const [mint, pos] of openPositions) {
+      // Check if position has tokens that need selling but wasn't closed
+      if (pos.tokenAmount > 0 && pos.status === 'open') {
+        log('info', `Retrying close for ${mint.slice(0,8)}...`);
+        await this.closePosition(mint, 'retry_close');
+        retried++;
+      }
+    }
+    
+    return retried;
+  }
+
   _logTrade(pos) {
     const sign = pos.pnlSOL >= 0 ? '+' : '';
     log(

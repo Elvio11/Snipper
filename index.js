@@ -221,9 +221,8 @@ async function main() {
         const tokenReceived = Number(solQuote.outAmount);
         log('info', `SOL liquidity confirmed: ~${tokenReceived} tokens per 0.001 SOL`);
       } catch (err) {
-        log('warn', `SOL liquidity check failed: ${err.message}`);
-        resetBuying();
-        return;
+        log('warn', `SOL liquidity check failed: ${err.message} — continuing anyway`);
+        // Don't skip trade - continue with DexScreener/fallback price
       }
     } else {
       log('info', `SOL liquidity check skipped (PAPER_TRADING)`);
@@ -322,6 +321,7 @@ async function main() {
   // ─── Position monitoring loop ───────────────────────────────────────────
   let lastMonitoredPrices = {};
   let isMonitoring = false;
+  let lastRetryTime = 0;
   
   setInterval(async () => {
     // PREVENT OVERLAPPING EXECUTIONS
@@ -409,6 +409,15 @@ async function main() {
       }
       log('info', '═══════════════════════════════════════════════════');
       console.log();
+    }
+    
+    // Every 60 seconds, retry any positions that failed to close
+    if (Date.now() - lastRetryTime > 60000) {
+      const retried = await positions.retryFailedCloses();
+      if (retried > 0) {
+        log('info', `Retried ${retried} failed position close(s)`);
+      }
+      lastRetryTime = Date.now();
     }
   }, 60_000); // every minute
 
