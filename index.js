@@ -12,7 +12,7 @@ import { PoolService } from './src/services/pool.js';
 import { getTokenPriceInSOL, getPoolLiquidityUSD, getPriceFromPool } from './price.js';
 import { initTelegram, sendAlert, setPositionManager } from './telegram.js';
 import { shinobiWS } from './shinobi-ws.js';
-import { dexScanner } from './src/services/dex-scanner.js';
+
 
 // ─── Global Error Handlers ──────────────────────────────────────────────────
 process.on('uncaughtException', (err) => {
@@ -44,10 +44,6 @@ async function gracefulShutdown(signal) {
       await monitor.stop();
     }
 
-    if (CONFIG.SCANNER_ENABLED) {
-      dexScanner.stop();
-    }
-    
     if (positions) {
       log('info', 'Saving open positions...');
       positions._save();
@@ -175,11 +171,15 @@ async function main() {
     const vaultBalance = await getVaultBalance();
     const totalBalance = signerBalance + vaultBalance;
     
+    const closedPnL = positions.getTotalClosedPnL();
+    const effectiveVault = vaultBalance + closedPnL;
+    
     const buyAmount = CONFIG.USE_GRADUATED_SCALING 
-      ? getDynamicBuyAmount(totalBalance, CONFIG._solPrice || 90)
+      ? getDynamicBuyAmount(totalBalance, CONFIG._solPrice || 90, vaultBalance, closedPnL)
       : CONFIG.BUY_AMOUNT_SOL;
     
-    log('info', `💰 Balance: ${totalBalance.toFixed(4)} SOL (S:${signerBalance.toFixed(3)} V:${vaultBalance.toFixed(3)}) | Buy: ${buyAmount.toFixed(6)} SOL`);
+    const compundingMsg = closedPnL !== 0 ? ` (+${closedPnL.toFixed(4)} profit)` : '';
+    log('info', `💰 Balance: ${totalBalance.toFixed(4)} SOL (S:${signerBalance.toFixed(3)} V:${vaultBalance.toFixed(3)}${compundingMsg}) | Buy: ${buyAmount.toFixed(6)} SOL`);
     
     if (totalBalance < buyAmount + 0.005) {
       log('warn', `Insufficient balance: ${totalBalance.toFixed(4)} SOL (need ${buyAmount.toFixed(4)} SOL)`);
@@ -461,12 +461,7 @@ async function main() {
       shinobiWS.connect();
     }
 
-    // Start DexScreener scanner if enabled
-    if (CONFIG.SCANNER_ENABLED) {
-      dexScanner.start();
-      log('info', 'DexScreener scanner enabled');
     }
-  }
 
   // ─── Shinobi WebSocket trade handler ─────────────────────────────────────
   if (CONFIG.USE_SHINOBI_WS) {
@@ -491,8 +486,9 @@ async function main() {
         const balance = await getSOLBalance();
         const vaultBalance = await getVaultBalance();
         const totalBalance = balance + vaultBalance;
+        const closedPnL = positions.getTotalClosedPnL();
         const buyAmount = CONFIG.USE_GRADUATED_SCALING 
-          ? getDynamicBuyAmount(totalBalance, CONFIG._solPrice || 90)
+          ? getDynamicBuyAmount(totalBalance, CONFIG._solPrice || 90, vaultBalance, closedPnL)
           : CONFIG.BUY_AMOUNT_SOL;
         
         if (totalBalance < buyAmount + 0.005) {

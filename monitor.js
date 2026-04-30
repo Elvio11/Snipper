@@ -5,6 +5,7 @@ import { log }                  from './logger.js';
 import { EventEmitter }         from 'events';
 import { CONFIG }               from './config.js';
 import { PoolService }          from './src/services/pool.js';
+import { dexService }           from './src/services/dexscreener-service.js';
 
 const RAYDIUM_CLMM   = 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK';
 const RAYDIUM_CPMM   = 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C';
@@ -272,28 +273,43 @@ export class PoolMonitor extends EventEmitter {
     const poll = async () => {
       this._pollCounter++;
       try {
-        const res = await fetch(
-          'https://api.dexscreener.com/token-profiles/latest/v1',
-          { signal: AbortSignal.timeout(8000) }
-        );
-        if (!res.ok) return;
-        const items = await res.json();
+        // Use dexService (with 3-API routing and rate limiting)
+        const result = await dexService.getNewPairs('solana', 20);
+        if (!result.success || !result.data) {
+          return;
+        }
         
-        for (const item of (Array.isArray(items) ? items : [])) {
-          if (item.chainId !== 'solana') continue;
-          const mint = item.tokenAddress;
+        for (const pair of result.data) {
+          if (pair.chainId !== 'solana') continue;
+          const mint = pair.baseToken?.address;
           if (!mint || this._seen.has('ds_' + mint)) continue;
           
-          const updatedAtMs = item.updatedAt ? new Date(item.updatedAt).getTime() : 0;
-          const ageMs = Date.now() - updatedAtMs;
-          if (ageMs > 600000) continue;
+          // Only process recent pairs (within last 5 minutes)
+          const pairAge = Date.now() - (pair.pairCreatedAt || 0);
+          if (pairAge > 300000) continue;
+          
+          // Check liquidity - lower threshold to catch new tokens
+          const liquidity = pair.liquidity?.usd || 0;
+          if (liquidity < 50) continue;
           
           this._seen.add('ds_' + mint);
-          const pool = await this._fetchDexScreenerPool(mint);
-          if (pool) {
-            log('snipe', `[L3] DexScreener: ${mint.slice(0,10)}...`);
-            this._onPool(pool, 'L3');
-          }
+          
+          const pool = {
+            signature: 'ds_' + mint,
+            poolId: pair.pairAddress,
+            tokenMint: mint,
+            baseMint: mint,
+            quoteMint: 'So11111111111111111111111111111111111111112',
+            vaultA: null,
+            vaultB: null,
+            program: 'dexscreener',
+            liquidityUSD: liquidity,
+            timestamp: Date.now(),
+            source: 'dexscreener',
+          };
+          
+          log('snipe', `[L3] DexScreener: ${mint.slice(0,10)}... liq:$${liquidity.toFixed(0)}`);
+          this._onPool(pool, 'L3');
         }
       } catch (e) {
         log('warn', `[L3] Poll error: ${e.message}`);
@@ -301,8 +317,8 @@ export class PoolMonitor extends EventEmitter {
     };
 
     poll();
-    this._pollTimer = setInterval(poll, 30_000);
-    log('success', '[L3] DexScreener polling active (30s interval)');
+    this._pollTimer = setInterval(poll, 10_000); // Reduced to 10s for faster detection
+    log('success', '[L3] DexScreener polling active (10s interval)');
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -430,12 +446,10 @@ export class PoolMonitor extends EventEmitter {
 
   async _fetchDexScreenerPool(mint) {
     try {
-      const res = await fetch(
-        `https://api.dexscreener.com/latest/dex/tokens/${mint}`,
-        { signal: AbortSignal.timeout(8000) }
-      );
-      const data = await res.json();
-      const pair = (data?.pairs ?? []).find(p =>
+      const result = await dexService.getTokenPairs(mint);
+      if (!result.success || !result.data?.length) return null;
+      
+      const pair = result.data.find(p =>
         p.chainId === 'solana' && (p.dexId?.includes('raydium') || p.dexId?.includes('pump'))
       );
       if (!pair) return null;

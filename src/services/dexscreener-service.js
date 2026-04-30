@@ -10,7 +10,7 @@ class DexScreenerService {
   constructor(config = {}) {
     this.config = {
       apiUrls: config.apiUrls || DEFAULT_API_URLS,
-      rateLimitDelay: config.rateLimitDelay || 100,
+      rateLimitDelay: config.rateLimitDelay || 3000,  // 3s delay to stay under 60/min
       maxRetries: config.maxRetries || 3,
     };
     this.currentApiIndex = 0;
@@ -92,19 +92,62 @@ class DexScreenerService {
   }
 
   async getNewPairs(chain = 'solana', limit = 20) {
-    const result = await this.makeRequest(`/latest/dex/tokens/${chain}`, {
-      sort: 'created',
-      order: 'desc',
-      limit
+    // Note: /latest/dex/tokens/{chain} returns pairs: null 
+    // Use token-profiles to get recent tokens, then fetch their pairs
+    
+    // First get recent token addresses from token-profiles
+    const profiles = await this.makeRequest('/token-profiles/latest/v1', { limit: limit.toString() });
+    
+    if (!profiles.success || !Array.isArray(profiles.data) || profiles.data.length === 0) {
+      // Fallback to search endpoint
+      return this._getNewPairsFallback(chain, limit);
+    }
+    
+    // Extract token addresses
+    const tokenAddresses = profiles.data
+      .slice(0, limit)
+      .map(p => p.tokenAddress)
+      .filter(Boolean);
+    
+    if (tokenAddresses.length === 0) {
+      return { success: false, error: 'No token addresses found' };
+    }
+    
+    // Fetch pairs for these tokens (batch up to 30)
+    const pairsResult = await this.makeRequest(`/latest/dex/tokens/${tokenAddresses.join(',')}`);
+    
+    if (!pairsResult.success || !pairsResult.data?.pairs) {
+      return { success: false, error: pairsResult.error || 'Failed to fetch pairs' };
+    }
+    
+    // Filter by chain and sort by creation time
+    const filteredPairs = pairsResult.data.pairs
+      .filter(p => p.chainId === chain)
+      .sort((a, b) => (b.pairCreatedAt || 0) - (a.pairCreatedAt || 0));
+    
+    return {
+      success: true,
+      data: filteredPairs
+    };
+  }
+
+  async _getNewPairsFallback(chain, limit) {
+    // Fallback: use search endpoint (not time-sorted but better than nothing)
+    const result = await this.makeRequest('/latest/dex/search', {
+      q: 'new',
+      limit: limit.toString()
     });
     
     if (!result.success || !result.data?.pairs) {
       return { success: false, error: result.error || 'No pairs found' };
     }
     
+    const filteredPairs = result.data.pairs.filter(p => p.chainId === chain);
+    
     return {
       success: true,
-      data: result.data.pairs
+      data: filteredPairs,
+      note: 'Fallback - not time-sorted'
     };
   }
 
@@ -187,6 +230,60 @@ class DexScreenerService {
       success: true,
       data: filteredPairs
     };
+  }
+
+  async getTokenSecurity(tokenMint) {
+    const result = await this.getTokenPairs(tokenMint);
+    
+    if (!result.success || !result.data?.length) {
+      return { success: false, error: 'Token not found' };
+    }
+    
+    const pair = result.data[0];
+    return {
+      success: true,
+      data: {
+        liquidityUSD: pair.liquidity?.usd || 0,
+        volume24h: pair.volume?.h24 || 0,
+        priceNative: pair.priceNative,
+        priceUSD: pair.priceUsd,
+        mintAuth: pair.tokenApproval?.authority || null,
+        freezeAuth: pair.tokenApproval?.freezeAuthority || null,
+        pairAddress: pair.pairAddress,
+        dexId: pair.dexId,
+      }
+    };
+  }
+
+  async getTokenPrice(tokenMint) {
+    const result = await this.getTokenPairs(tokenMint);
+    
+    if (!result.success || !result.data?.length) {
+      return { success: false };
+    }
+    
+    const pair = result.data[0];
+    return {
+      success: true,
+      data: {
+        priceNative: parseFloat(pair.priceNative || 0),
+        priceUSD: parseFloat(pair.priceUsd || 0),
+        liquidityUSD: pair.liquidity?.usd || 0,
+      }
+    };
+  }
+
+  async getRecentTokenAddresses(limit = 20) {
+    const result = await this.getNewPairs('solana', limit);
+    
+    if (!result.success || !result.data) {
+      return [];
+    }
+    
+    return result.data
+      .filter(p => p.chainId === 'solana')
+      .map(pair => pair.baseToken?.address)
+      .filter(Boolean);
   }
 }
 

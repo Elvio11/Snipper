@@ -10,7 +10,6 @@ import { dexService } from './dexscreener-service.js';
 const RAYDIUM_API = 'https://api-v3.raydium.io';
 const JUPITER_PRICE = 'https://price.jup.ag/v6';
 const JUPITER_QUOTE = 'https://quote-api.jup.ag/v6';
-const DEX_API = 'https://api.dexscreener.com';
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
 const RAYDIUM_CLMM_PROGRAM = new PublicKey('CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK');

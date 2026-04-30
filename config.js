@@ -77,9 +77,9 @@ export const CONFIG = {
   // DexScreener Scanner Config
   SCANNER_ENABLED: process.env.SCANNER_ENABLED === 'true',
   SCANNER_POLL_INTERVAL: parseInt(process.env.SCANNER_POLL_INTERVAL || '5000'),
-  SCANNER_MIN_LIQUIDITY: parseFloat(process.env.SCANNER_MIN_LIQUIDITY || '1000'),
-  SCANNER_MIN_VOLUME: parseFloat(process.env.SCANNER_MIN_VOLUME || '100'),
-  SCANNER_MIN_TXNS: parseInt(process.env.SCANNER_MIN_TXNS || '5'),
+  SCANNER_MIN_LIQUIDITY: parseFloat(process.env.SCANNER_MIN_LIQUIDITY || '50'),
+  SCANNER_MIN_VOLUME: parseFloat(process.env.SCANNER_MIN_VOLUME || '20'),
+  SCANNER_MIN_TXNS: parseInt(process.env.SCANNER_MIN_TXNS || '0'),
   SCANNER_MAX_CANDIDATES: parseInt(process.env.SCANNER_MAX_CANDIDATES || '3'),
   SCANNER_SCORE_THRESHOLD: parseFloat(process.env.SCANNER_SCORE_THRESHOLD || '50'),
 };
@@ -103,23 +103,32 @@ export function setSolPrice(price) {
   CONFIG._solPrice = price;
 }
 
-export function getDynamicBuyAmount(balanceSOL = 0, solPrice = 90) {
+export function getDynamicBuyAmount(balanceSOL = 0, solPrice = 90, vaultSOL = 0, closedPnL = 0) {
   if (!CONFIG.USE_GRADUATED_SCALING) {
     return CONFIG.BUY_AMOUNT_SOL;
   }
   
-  const balanceUSD = balanceSOL * solPrice;
+  // COMPOUNDING: initial vault + accumulated profits
+  const effectiveVaultSOL = vaultSOL + closedPnL;
+  
+  // Use effective vault for compounding logic
+  const effectiveVaultUSD = effectiveVaultSOL * solPrice;
   let fraction = 0.20;
   
   for (const phase of CONFIG.SCALING_PHASES) {
-    if (balanceUSD >= phase.min && balanceUSD < phase.max) {
+    if (effectiveVaultUSD >= phase.min && effectiveVaultUSD < phase.max) {
       fraction = phase.fraction;
       break;
     }
   }
   
-  const buyAmount = balanceSOL * fraction;
-  const scaled = Math.min(buyAmount, CONFIG.SCALING_MAX_BALANCE / solPrice);
+  // Formula: vault × (fraction / maxPositions) = per-trade amount
+  const perTradeFraction = fraction / CONFIG.MAX_POSITIONS;
+  const buyAmount = effectiveVaultSOL * perTradeFraction;
+  
+  // Cap at $50 max per trade
+  const maxTradeUSD = 50;
+  const scaled = Math.min(buyAmount, maxTradeUSD / solPrice);
   
   return Math.max(scaled, 0.001);
 }
