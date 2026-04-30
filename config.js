@@ -73,6 +73,15 @@ export const CONFIG = {
         { min: 20,   max: 50,  fraction: 0.50 },
         { min: 50,   max: Infinity, fraction: 0.70 },
       ],
+
+  // DexScreener Scanner Config
+  SCANNER_ENABLED: process.env.SCANNER_ENABLED === 'true',
+  SCANNER_POLL_INTERVAL: parseInt(process.env.SCANNER_POLL_INTERVAL || '5000'),
+  SCANNER_MIN_LIQUIDITY: parseFloat(process.env.SCANNER_MIN_LIQUIDITY || '1000'),
+  SCANNER_MIN_VOLUME: parseFloat(process.env.SCANNER_MIN_VOLUME || '100'),
+  SCANNER_MIN_TXNS: parseInt(process.env.SCANNER_MIN_TXNS || '5'),
+  SCANNER_MAX_CANDIDATES: parseInt(process.env.SCANNER_MAX_CANDIDATES || '3'),
+  SCANNER_SCORE_THRESHOLD: parseFloat(process.env.SCANNER_SCORE_THRESHOLD || '50'),
 };
 
 export function validateConfig() {
