@@ -413,10 +413,11 @@ async function main() {
     
     // Every 60 seconds, retry any positions that failed to close
     if (Date.now() - lastRetryTime > 60000) {
-      const retried = await positions.retryFailedCloses();
-      if (retried > 0) {
-        log('info', `Retried ${retried} failed position close(s)`);
-      }
+      positions.retryFailedCloses().then(retried => {
+        if (retried > 0) {
+          log('info', `Retried ${retried} failed position close(s)`);
+        }
+      }).catch(err => log('error', `Retry failed: ${err.message}`));
       lastRetryTime = Date.now();
     }
   }, 60_000); // every minute
