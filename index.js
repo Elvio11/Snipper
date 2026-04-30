@@ -12,6 +12,7 @@ import { PoolService } from './src/services/pool.js';
 import { getTokenPriceInSOL, getPoolLiquidityUSD, getPriceFromPool } from './price.js';
 import { initTelegram, sendAlert, setPositionManager } from './telegram.js';
 import { shinobiWS } from './shinobi-ws.js';
+import { dexScanner } from './src/services/dex-scanner.js';
 
 // ─── Global Error Handlers ──────────────────────────────────────────────────
 process.on('uncaughtException', (err) => {
@@ -41,6 +42,10 @@ async function gracefulShutdown(signal) {
     if (monitor) {
       log('info', 'Stopping pool monitor...');
       await monitor.stop();
+    }
+
+    if (CONFIG.SCANNER_ENABLED) {
+      dexScanner.stop();
     }
     
     if (positions) {
@@ -454,6 +459,12 @@ async function main() {
     await monitor.start();
     if (CONFIG.USE_SHINOBI_WS) {
       shinobiWS.connect();
+    }
+
+    // Start DexScreener scanner if enabled
+    if (CONFIG.SCANNER_ENABLED) {
+      dexScanner.start();
+      log('info', 'DexScreener scanner enabled');
     }
   }
 
