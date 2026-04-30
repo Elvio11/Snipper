@@ -1,5 +1,4 @@
 // src/services/dexscreener-service.js
-import axios from 'axios';
 
 const DEFAULT_API_URLS = [
   'https://api.dexscreener.com',
@@ -63,15 +62,21 @@ class DexScreenerService {
         const api = this.getCurrentApi();
         const url = `${api}${endpoint}`;
         
-        const response = method === 'get' 
-          ? await axios.get(url, { params, timeout: 10000 })
-          : await axios.post(url, params, { timeout: 10000 });
+        const response = await fetch(url + '?' + new URLSearchParams(params), { 
+            method: method.toUpperCase(),
+            signal: AbortSignal.timeout(10000)
+          });
         
-        return { success: true, data: response.data };
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        
+        const data = await response.json();
+        return { success: true, data };
       } catch (error) {
         lastError = error;
         
-        if (error.response?.status === 429) {
+        if (error.message?.includes('429')) {
           this.failedApis.add(this.currentApiIndex);
           this.rotateApi();
           continue;
