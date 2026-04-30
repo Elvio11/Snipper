@@ -125,7 +125,9 @@ export async function analyzeToken(mintAddress) {
 
     // Honeypot check via Jupiter
     if (CONFIG.HONEYPOT_CHECK) {
+      log('info', `Running honeypot check for ${mintAddress.slice(0,8)}...`);
       const honeypot = await simulateHoneypot(mintAddress);
+      log('info', `Honeypot check result: ${JSON.stringify(honeypot)}`);
       if (honeypot.isHoneypot) {
         reasons.push(`✖ Honeypot detected: ${honeypot.reason}`);
         return { safe: false, reasons, score: 0 };
@@ -143,15 +145,43 @@ export async function analyzeToken(mintAddress) {
 
 async function simulateHoneypot(mintAddress) {
   try {
+    log('info', `Honeypot check: Testing buy/sell quotes for ${mintAddress.slice(0,8)}...`);
+    
     // ROBUST: Try BOTH buy and sell quotes to verify liquidity
     const sellUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${mintAddress}&outputMint=${SOL_MINT}&amount=1000000&slippageBps=5000`;
     const buyUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${SOL_MINT}&outputMint=${mintAddress}&amount=1000000&slippageBps=5000`;
     
-    // Fetch both quotes in parallel
+    // Create timeout-safe fetch
+    const fetchWithTimeout = async (url, timeout = 5000) => {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeout);
+      try {
+        const response = await fetch(url, { signal: controller.signal });
+        clearTimeout(timeoutId);
+        return response;
+      } catch (e) {
+        clearTimeout(timeoutId);
+        throw e;
+      }
+    };
+    
+    // Fetch both quotes in parallel with timeout
     const [sellRes, buyRes] = await Promise.all([
-      fetch(sellUrl, { signal: AbortSignal.timeout(8000) }),
-      fetch(buyUrl, { signal: AbortSignal.timeout(8000) })
+      fetchWithTimeout(sellUrl, 5000).catch(e => ({ error: true, errorMsg: e.message })),
+      fetchWithTimeout(buyUrl, 5000).catch(e => ({ error: true, errorMsg: e.message }))
     ]);
+    
+    // Check if fetch itself failed
+    if (sellRes.error || buyRes.error) {
+      log('warn', `Honeypot check: API unreachable - treating as honeypot`);
+      return { isHoneypot: true, reason: 'Jupiter API unreachable - cannot verify token' };
+    }
+    
+    // Check response status
+    if (!sellRes.ok || !buyRes.ok) {
+      log('warn', `Honeypot check: API returned error status`);
+      return { isHoneypot: true, reason: 'Jupiter API returned error' };
+    }
     
     const sellData = await sellRes.json();
     const buyData = await buyRes.json();
@@ -175,10 +205,12 @@ async function simulateHoneypot(mintAddress) {
       return { isHoneypot: true, reason: 'Suspiciously low buy output' };
     }
     
+    log('info', `Honeypot check passed: sell=${sellAmount.toFixed(4)} SOL, buy=${buyAmount.toFixed(0)} tokens`);
     return { isHoneypot: false };
   } catch (err) {
     // If we can't get quotes, treat as potential honeypot (conservative)
-    return { isHoneypot: true, reason: `Cannot get quotes: ${err.message}` };
+    log('warn', `Honeypot check error: ${err.message} - treating as honeypot`);
+    return { isHoneypot: true, reason: `Cannot verify token: ${err.message}` };
   }
 }
 
