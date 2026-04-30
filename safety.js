@@ -3,6 +3,7 @@ import { getMint } from '@solana/spl-token';
 import { getConnection } from './wallet.js';
 import { CONFIG } from './config.js';
 import { log } from './logger.js';
+import { dexService } from './src/services/dexscreener-service.js';
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
@@ -13,12 +14,11 @@ const SOL_MINT = 'So11111111111111111111111111111111111111112';
  */
 export async function getRecentIndexedTokens(limit = 20) {
   try {
-    const res = await fetch(
-      `https://api.dexscreener.com/latest/dex/tokens/solana?sort=created&order=desc&limit=${limit}`,
-      { signal: AbortSignal.timeout(10000) }
-    );
-    const data = await res.json();
-    return data?.pairs || [];
+    const result = await dexService.getRecentTokens(limit);
+    if (result.success && result.data) {
+      return result.data;
+    }
+    return [];
   } catch (err) {
     log('warn', `Failed to fetch recent tokens: ${err.message}`);
     return [];
@@ -30,23 +30,19 @@ export async function getRecentIndexedTokens(limit = 20) {
  */
 export async function getTokenSecurityFromDexScreener(tokenMint) {
   try {
-    const res = await fetch(
-      `https://api.dexscreener.com/latest/dex/pairs/solana/${tokenMint}`,
-      { signal: AbortSignal.timeout(8000) }
-    );
-    const data = await res.json();
-    if (!data?.pair) return null;
+    const result = await dexService.getTokenSecurity(tokenMint);
+    if (!result.success || !result.data) return null;
     
-    const pair = data.pair;
+    const pair = result.data;
     return {
-      liquidityUSD: pair.liquidity?.usd || 0,
-      liquidityQuote: pair.liquidity?.quoteToken || 0,
-      priceUSD: pair.priceUsd || 0,
-      txns24h: pair.txns?.h24?.buys + pair.txns?.h24?.sells || 0,
-      volume24h: pair.volume?.h24 || 0,
-      createdAt: pair.dex?.labels?.[0] || null,
+      liquidityUSD: pair.liquidityUSD || 0,
+      liquidityQuote: 0,
+      priceUSD: pair.priceUSD || 0,
+      txns24h: 0,
+      volume24h: pair.volume24h || 0,
+      createdAt: null,
       pairAddress: pair.pairAddress,
-      tokenAddress: pair.baseToken?.address,
+      tokenAddress: tokenMint,
     };
   } catch {
     return null;
@@ -155,8 +151,9 @@ async function simulateHoneypot(mintAddress) {
       return { isHoneypot: true, reason: data.error || 'No sell route' };
     }
     return { isHoneypot: false };
-  } catch {
-    return { isHoneypot: false, reason: 'timeout' };
+  } catch (err) {
+    // If we can't get a quote, treat as potential honeypot (conservative)
+    return { isHoneypot: true, reason: `Cannot get sell quote: ${err.message}` };
   }
 }
 
