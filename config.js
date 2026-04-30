@@ -19,7 +19,7 @@ export const CONFIG = {
   // Trade controls
   BUY_AMOUNT_SOL:            parseFloat(process.env.BUY_AMOUNT_SOL || '0.01'),
   TAKE_PROFIT_MULTIPLIER:    parseFloat(process.env.TAKE_PROFIT_MULTIPLIER || '1.2'),
-  STOP_LOSS_PERCENT:         parseFloat(process.env.STOP_LOSS_PERCENT || '25'),
+  STOP_LOSS_PERCENT:         parseFloat(process.env.STOP_LOSS_PERCENT || '20'),
   SLIPPAGE_PERCENT:          parseFloat(process.env.SLIPPAGE_PERCENT || '10'),
   MAX_POSITIONS:             parseInt(process.env.MAX_POSITIONS || '3'),
 

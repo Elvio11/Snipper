@@ -1,0 +1,35 @@
+SniperBOT Trade Testing Results
+=============================
+Date: 2026-04-28
+
+TOTAL SUMMARY
+============
+Total Trades: 101
+Wins: 62
+Losses: 39
+Win Rate: 61.4%
+Net P&L: +0.1144 SOL
+
+PERFORMANCE BY EXIT REASON
+======================
+| Exit Reason      | Trades | Wins | Losses | Win SOL  | Loss SOL | Net SOL  |
+|---------------|--------|------|--------|---------|----------|---------|
+| Take Profit   | 60     | 60   | 0      | +0.3365  | 0        | +0.3365  |
+| Stop Loss      | 33     | 0   | 33     | 0        | -0.2174  | -0.2174  |
+| Max Hold      | 8      | 2   | 6      | +0.0008  | -0.0055  | -0.0047  |
+| TOTAL         | 101    | 62  | 39     | +0.3373  | -0.2229  | +0.1144  |
+
+TRADE STATISTICS
+===============
+Best Trade: +0.0177 SOL (+98.7%)
+Worst Trade: -0.0118 SOL (-65.7%)
+Average Win: +0.0054 SOL
+Average Loss: -0.0057 SOL
+
+CONFIGURATION DURING TEST
+=====================
+Take Profit: 1.4x (later updated to 1.35x)
+Stop Loss: 20-25%
+Max Hold: 15 minutes
+Monitoring: 3 seconds
+Sell Mode: Instant sell (no limit orders)

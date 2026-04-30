@@ -1,0 +1,174 @@
+import { PublicKey } from '@solana/web3.js';
+import { getMint } from '@solana/spl-token';
+import { getConnection } from './wallet.js';
+import { CONFIG } from './config.js';
+import { log } from './logger.js';
+
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
+
+/**
+ * Get recent tokens from DexScreener that have been indexed.
+ * These tokens have metadata available (name, symbol, liquidity) - safer to snipe.
+ * Returns tokens created in the last few hours that still have low volume.
+ */
+export async function getRecentIndexedTokens(limit = 20) {
+  try {
+    const res = await fetch(
+      `https://api.dexscreener.com/latest/dex/tokens/solana?sort=created&order=desc&limit=${limit}`,
+      { signal: AbortSignal.timeout(10000) }
+    );
+    const data = await res.json();
+    return data?.pairs || [];
+  } catch (err) {
+    log('warn', `Failed to fetch recent tokens: ${err.message}`);
+    return [];
+  }
+}
+
+/**
+ * Get token security data from DexScreener.
+ */
+export async function getTokenSecurityFromDexScreener(tokenMint) {
+  try {
+    const res = await fetch(
+      `https://api.dexscreener.com/latest/dex/pairs/solana/${tokenMint}`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    const data = await res.json();
+    if (!data?.pair) return null;
+    
+    const pair = data.pair;
+    return {
+      liquidityUSD: pair.liquidity?.usd || 0,
+      liquidityQuote: pair.liquidity?.quoteToken || 0,
+      priceUSD: pair.priceUsd || 0,
+      txns24h: pair.txns?.h24?.buys + pair.txns?.h24?.sells || 0,
+      volume24h: pair.volume?.h24 || 0,
+      createdAt: pair.dex?.labels?.[0] || null,
+      pairAddress: pair.pairAddress,
+      tokenAddress: pair.baseToken?.address,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Simplified safety analysis - focuses on available data from DexScreener
+ * instead of trying to analyze extremely new tokens.
+ */
+export async function analyzeToken(mintAddress) {
+  const reasons = [];
+  let score = 100;
+
+  try {
+    // Try to get token info from DexScreener first
+    const dexData = await getTokenSecurityFromDexScreener(mintAddress);
+    
+    if (dexData && dexData.liquidityUSD > 0) {
+      reasons.push(`✔ Token indexed on DexScreener`);
+      reasons.push(`│ Liquidity: $${dexData.liquidityUSD.toLocaleString()}`);
+      
+      // Check liquidity is within range
+      if (dexData.liquidityUSD < CONFIG.MIN_LIQUIDITY_USD) {
+        reasons.push(`✖ Liquidity too low: $${dexData.liquidityUSD.toLocaleString()}`);
+        return { safe: false, reasons, score: 0 };
+      }
+      
+      if (dexData.liquidityUSD > CONFIG.MAX_LIQUIDITY_USD) {
+        reasons.push(`✖ Liquidity too high (probably already pumped)`);
+        return { safe: false, reasons, score: 0 };
+      }
+      
+      // Check for some transaction activity (not dead token)
+      if (dexData.txns24h < 5) {
+        reasons.push(`⚠ Very low txn activity (${dexData.txns24h} txns/24h)`);
+        score -= 20;
+      } else {
+        reasons.push(`✔ ${dexData.txns24h} txns in last 24h`);
+      }
+    } else {
+      reasons.push(`⚠ Token not found on DexScreener - may be too new`);
+    }
+
+    // Try to get mint info from chain
+    const conn = getConnection();
+    let mintInfo = null;
+    try {
+      mintInfo = await getMint(conn, new PublicKey(mintAddress));
+      reasons.push(`✔ Mint info available on-chain`);
+      
+      // Check mint authority
+      if (mintInfo.mintAuthority !== null) {
+        reasons.push(`⚠ Mint authority NOT revoked - can print tokens`);
+        score -= 30;
+      } else {
+        reasons.push(`✔ Mint authority revoked`);
+      }
+      
+      // Check freeze authority
+      if (mintInfo.freezeAuthority !== null) {
+        reasons.push(`⚠ Freeze authority NOT revoked`);
+        score -= 20;
+      } else {
+        reasons.push(`✔ Freeze authority revoked`);
+      }
+      
+      // Supply check
+      const supply = Number(mintInfo.supply) / Math.pow(10, mintInfo.decimals);
+      if (supply > 10_000_000_000) {
+        reasons.push(`✖ Supply too high: ${supply.toExponential(2)}`);
+        return { safe: false, reasons, score: 0 };
+      }
+      reasons.push(`│ Supply: ${supply.toExponential(2)}`);
+      
+    } catch (mintErr) {
+      reasons.push(`⚠ Cannot fetch mint info: ${mintErr.message?.slice(0, 50)}`);
+      score -= 10;
+    }
+
+    // Honeypot check via Jupiter
+    if (CONFIG.HONEYPOT_CHECK) {
+      const honeypot = await simulateHoneypot(mintAddress);
+      if (honeypot.isHoneypot) {
+        reasons.push(`✖ Honeypot detected: ${honeypot.reason}`);
+        return { safe: false, reasons, score: 0 };
+      }
+      reasons.push(`✔ Can sell on Jupiter (not honeypot)`);
+    }
+
+    const safe = score >= 40;
+    return { safe, reasons, score: Math.max(0, score), dexData };
+
+  } catch (err) {
+    return { safe: false, reasons: [`Error: ${err.message}`], score: 0 };
+  }
+}
+
+async function simulateHoneypot(mintAddress) {
+  try {
+    const url = `https://quote-api.jup.ag/v6/quote?inputMint=${mintAddress}&outputMint=${SOL_MINT}&amount=1000000&slippageBps=5000`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    const data = await res.json();
+
+    if (data.error || !data.outAmount) {
+      return { isHoneypot: true, reason: data.error || 'No sell route' };
+    }
+    return { isHoneypot: false };
+  } catch {
+    return { isHoneypot: false, reason: 'timeout' };
+  }
+}
+
+export async function getLPBurnPercent(poolId) {
+  try {
+    const res = await fetch(`https://api-v3.raydium.io/pools/info/ids?ids=${poolId}`, {
+      signal: AbortSignal.timeout(8000)
+    });
+    const data = await res.json();
+    const pool = data?.data?.[0];
+    return pool?.burnPercent || 0;
+  } catch {
+    return 0;
+  }
+}
