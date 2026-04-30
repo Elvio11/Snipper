@@ -143,17 +143,42 @@ export async function analyzeToken(mintAddress) {
 
 async function simulateHoneypot(mintAddress) {
   try {
-    const url = `https://quote-api.jup.ag/v6/quote?inputMint=${mintAddress}&outputMint=${SOL_MINT}&amount=1000000&slippageBps=5000`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-    const data = await res.json();
-
-    if (data.error || !data.outAmount) {
-      return { isHoneypot: true, reason: data.error || 'No sell route' };
+    // ROBUST: Try BOTH buy and sell quotes to verify liquidity
+    const sellUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${mintAddress}&outputMint=${SOL_MINT}&amount=1000000&slippageBps=5000`;
+    const buyUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${SOL_MINT}&outputMint=${mintAddress}&amount=1000000&slippageBps=5000`;
+    
+    // Fetch both quotes in parallel
+    const [sellRes, buyRes] = await Promise.all([
+      fetch(sellUrl, { signal: AbortSignal.timeout(8000) }),
+      fetch(buyUrl, { signal: AbortSignal.timeout(8000) })
+    ]);
+    
+    const sellData = await sellRes.json();
+    const buyData = await buyRes.json();
+    
+    // If either quote fails, it's a potential honeypot
+    if (sellData.error || !sellData.outAmount) {
+      return { isHoneypot: true, reason: 'No sell route (cannot sell back to SOL)' };
     }
+    if (buyData.error || !buyData.outAmount) {
+      return { isHoneypot: true, reason: 'No buy route (cannot buy with SOL)' };
+    }
+    
+    // Check if the quotes are reasonable (not zero or extremely low)
+    const sellAmount = parseFloat(sellData.outAmount) / 1e9; // Convert to SOL
+    const buyAmount = parseFloat(buyData.outAmount) / 1e6; // Convert to tokens
+    
+    if (sellAmount < 0.0001) {
+      return { isHoneypot: true, reason: 'Suspiciously low sell output' };
+    }
+    if (buyAmount < 100) {
+      return { isHoneypot: true, reason: 'Suspiciously low buy output' };
+    }
+    
     return { isHoneypot: false };
   } catch (err) {
-    // If we can't get a quote, treat as potential honeypot (conservative)
-    return { isHoneypot: true, reason: `Cannot get sell quote: ${err.message}` };
+    // If we can't get quotes, treat as potential honeypot (conservative)
+    return { isHoneypot: true, reason: `Cannot get quotes: ${err.message}` };
   }
 }
 
