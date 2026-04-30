@@ -31,13 +31,10 @@ export async function buyToken(mintAddress, solAmount = CONFIG.BUY_AMOUNT_SOL, p
 
       const wallet = getWallet();
       const swapResp = await jupiterApi.swapPost({
-        quoteResponse: quote,
-        userPublicKey: wallet.publicKey.toString(),
-        dynamicSlippage: CONFIG.DYNAMIC_SLIPPAGE ? {
-          minBps: CONFIG.DYNAMIC_SLIPPAGE_MIN_BPS || 50,
-          maxBps: CONFIG.DYNAMIC_SLIPPAGE_MAX_BPS || 3000,
-        } : undefined,
-        prioritizationFeeLamports: 'auto',
+        swapRequest: {
+          quoteResponse: quote,
+          userPublicKey: wallet.publicKey.toString(),
+        }
       });
 
       if (!swapResp || !swapResp.swapTransaction) {
@@ -103,13 +100,10 @@ export async function sellToken(mintAddress, tokenAmount, retries = 2) {
 
       const wallet = getWallet();
       const swapResp = await jupiterApi.swapPost({
-        quoteResponse: quote,
-        userPublicKey: wallet.publicKey.toString(),
-        dynamicSlippage: CONFIG.DYNAMIC_SLIPPAGE ? {
-          minBps: CONFIG.DYNAMIC_SLIPPAGE_MIN_BPS || 50,
-          maxBps: CONFIG.DYNAMIC_SLIPPAGE_MAX_BPS || 3000,
-        } : undefined,
-        prioritizationFeeLamports: 'auto',
+        swapRequest: {
+          quoteResponse: quote,
+          userPublicKey: wallet.publicKey.toString(),
+        }
       });
 
       if (!swapResp || !swapResp.swapTransaction) {
@@ -126,9 +120,14 @@ export async function sellToken(mintAddress, tokenAmount, retries = 2) {
         maxRetries: 3,
       });
 
-      await conn.confirmTransaction(txid, 'confirmed');
+      // Verify transaction actually succeeded on-chain
+      const confirmation = await conn.confirmTransaction(txid, 'confirmed');
+      
+      if (confirmation.value?.err) {
+        throw new Error(`Transaction failed on-chain: ${JSON.stringify(confirmation.value.err)}`);
+      }
 
-      log('success', `SELL confirmed: ${solReceived.toFixed(4)} SOL received`);
+      log('success', `SELL confirmed on-chain: ${solReceived.toFixed(4)} SOL received`);
       logTrade({
         type: 'sell',
         mint: mintAddress,
