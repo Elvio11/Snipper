@@ -54,6 +54,8 @@ export async function getTokenSecurityFromDexScreener(tokenMint) {
  * instead of trying to analyze extremely new tokens.
  */
 export async function analyzeToken(mintAddress) {
+  console.log('[SAFETY] Starting analysis for:', mintAddress.slice(0,8));
+  console.log('[SAFETY] HONEYPOT_CHECK enabled:', CONFIG.HONEYPOT_CHECK);
   const reasons = [];
   let score = 100;
 
@@ -123,17 +125,15 @@ export async function analyzeToken(mintAddress) {
       score -= 10;
     }
 
-    // Honeypot check via Jupiter
-    if (CONFIG.HONEYPOT_CHECK) {
-      log('info', `Running honeypot check for ${mintAddress.slice(0,8)}...`);
-      const honeypot = await simulateHoneypot(mintAddress);
-      log('info', `Honeypot check result: ${JSON.stringify(honeypot)}`);
-      if (honeypot.isHoneypot) {
-        reasons.push(`✖ Honeypot detected: ${honeypot.reason}`);
-        return { safe: false, reasons, score: 0 };
-      }
-      reasons.push(`✔ Can sell on Jupiter (not honeypot)`);
+    // Honeypot check via Jupiter - ALWAYS RUN, not optional
+    console.log('[SAFETY] Running mandatory honeypot check...');
+    const honeypot = await simulateHoneypot(mintAddress);
+    console.log('[SAFETY] Honeypot result:', JSON.stringify(honeypot));
+    if (honeypot.isHoneypot) {
+      reasons.push(`✖ Honeypot detected: ${honeypot.reason}`);
+      return { safe: false, reasons, score: 0 };
     }
+    reasons.push(`✔ Can sell on Jupiter (not honeypot)`);
 
     const safe = score >= 40;
     return { safe, reasons, score: Math.max(0, score), dexData };
