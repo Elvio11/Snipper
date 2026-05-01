@@ -8,8 +8,8 @@ import { log } from '../../logger.js';
 import { dexService } from './dexscreener-service.js';
 
 const RAYDIUM_API = 'https://api-v3.raydium.io';
-const JUPITER_PRICE = 'https://price.jup.ag/v6';
-const JUPITER_QUOTE = 'https://quote-api.jup.ag/v6';
+const JUPITER_PRICE = 'https://api.jup.ag/price/v2';
+const JUPITER_QUOTE = 'https://api.jup.ag';
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
 const RAYDIUM_CLMM_PROGRAM = new PublicKey('CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK');
@@ -127,6 +127,7 @@ export class PoolService {
 
 static async _fetchPriceWithFallback(tokenMint, poolAddress = null, retries = PRICE_RETRY_COUNT) {
     let lastError = null;
+    const cacheKey = `price:${tokenMint}`;
     
     for (let attempt = 0; attempt <= retries; attempt++) {
       if (attempt > 0) {
@@ -173,7 +174,7 @@ static async _fetchPriceWithFallback(tokenMint, poolAddress = null, retries = PR
    */
   static async getPriceFromJupiterQuote(tokenMint, tokenAmount = 1000000) {
     try {
-      const url = `${JUPITER_QUOTE}/quote?inputMint=${tokenMint}&outputMint=${SOL_MINT}&amount=${tokenAmount}&slippageBps=50`;
+      const url = `${JUPITER_QUOTE}/swap/v1/quote?inputMint=${tokenMint}&outputMint=${SOL_MINT}&amount=${tokenAmount}&slippageBps=50`;
       const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
       const data = await res.json();
       if (data.outAmount) {
@@ -340,8 +341,8 @@ static async _getDexScreenerData(tokenMint) {
   static async _getPriceFromJupiter(tokenMint) {
     try {
       const [solRes, tokenRes] = await Promise.all([
-        fetch(`${JUPITER_PRICE}/price?ids=${SOL_MINT}`, { signal: AbortSignal.timeout(5000) }),
-        fetch(`${JUPITER_PRICE}/price?ids=${tokenMint}`, { signal: AbortSignal.timeout(5000) }),
+        fetch(`${JUPITER_PRICE}?ids=${SOL_MINT}`, { signal: AbortSignal.timeout(5000) }),
+        fetch(`${JUPITER_PRICE}?ids=${tokenMint}`, { signal: AbortSignal.timeout(5000) }),
       ]);
       const [solData, tokenData] = await Promise.all([solRes.json(), tokenRes.json()]);
       const solUSD = solData?.data?.[SOL_MINT]?.price;
@@ -356,7 +357,7 @@ static async _getDexScreenerData(tokenMint) {
     const pool = await PoolService._getRaydiumPoolInfo(poolAddress);
     if (!pool?.price) return null;
     try {
-      const solRes = await fetch(`${JUPITER_PRICE}/price?ids=${SOL_MINT}`, {
+      const solRes = await fetch(`${JUPITER_PRICE}?ids=${SOL_MINT}`, {
         signal: AbortSignal.timeout(3000),
       });
       const solData = await solRes.json();
@@ -419,13 +420,19 @@ static async _getDexScreenerData(tokenMint) {
   static async _checkHoneypot(tokenMint) {
     try {
       const res = await fetch(
-        `${JUPITER_QUOTE}/v6/quote?inputMint=${tokenMint}&outputMint=${SOL_MINT}&amount=1000000&slippageBps=5000`,
+      `${JUPITER_QUOTE}/swap/v1/quote?inputMint=${tokenMint}&outputMint=${SOL_MINT}&amount=1000000&slippageBps=5000`,
         { signal: AbortSignal.timeout(8000) },
       );
+      if (!res.ok) {
+        return { isHoneypot: true, reason: `API error: ${res.status}` };
+      }
       const data = await res.json();
-      return data.outAmount ? { isHoneypot: false } : { isHoneypot: true, reason: data.error || 'No route' };
-    } catch {
-      return { isHoneypot: false, reason: 'timeout' };
+      if (data.error || !data.outAmount) {
+        return { isHoneypot: true, reason: data.error || 'No sell route' };
+      }
+      return { isHoneypot: false, reason: null };
+    } catch (err) {
+      return { isHoneypot: true, reason: `API unreachable: ${err.message}` };
     }
   }
 

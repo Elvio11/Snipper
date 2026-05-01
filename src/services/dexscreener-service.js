@@ -2,8 +2,6 @@
 
 const DEFAULT_API_URLS = [
   'https://api.dexscreener.com',
-  'https://api.dexscreener.io',
-  'https://api.dexscreener.com/v2'
 ];
 
 class DexScreenerService {
@@ -284,6 +282,64 @@ class DexScreenerService {
       .filter(p => p.chainId === 'solana')
       .map(pair => pair.baseToken?.address)
       .filter(Boolean);
+  }
+
+  // ✅ CORRECT ENDPOINT: Get pairs for token addresses (not profile feed)
+  async getTokenPairsByAddresses(tokenAddresses) {
+    if (!tokenAddresses || tokenAddresses.length === 0) {
+      return { success: false, error: 'No token addresses' };
+    }
+    
+    // Batch up to 30 addresses
+    const addresses = tokenAddresses.slice(0, 30).join(',');
+    const result = await this.makeRequest(`/latest/dex/tokens/${addresses}`);
+    
+    if (!result.success || !result.data?.pairs) {
+      return { success: false, error: result.error || 'No pairs found' };
+    }
+    
+    return {
+      success: true,
+      data: result.data.pairs.filter(p => p.chainId === 'solana')
+    };
+  }
+
+  // ✅ CORRECT ENDPOINT: Direct pair lookup by address
+  async getPairByAddress(pairAddress) {
+    const result = await this.makeRequest(`/latest/dex/pairs/solana/${pairAddress}`);
+    
+    if (!result.success || !result.data?.pair) {
+      return { success: false, error: result.error || 'Pair not found' };
+    }
+    
+    return {
+      success: true,
+      data: [result.data.pair] // Return in same format as getTokenPairs
+    };
+  }
+
+  // ✅ NEW METHOD: Get truly new pairs using search endpoint (not profile feed)
+  async getTrendingPairs(chain = 'solana', limit = 20) {
+    // Use search endpoint to find trending/new pairs
+    // This is better than token-profiles which is a marketing feed
+    const result = await this.makeRequest('/latest/dex/search', {
+      q: 'new',
+      limit: limit.toString()
+    });
+    
+    if (!result.success || !result.data?.pairs) {
+      return { success: false, error: result.error || 'No pairs found' };
+    }
+    
+    // Filter by chain and sort by creation time (newest first)
+    const pairs = result.data.pairs
+      .filter(p => p.chainId === chain)
+      .sort((a, b) => (b.pairCreatedAt || 0) - (a.pairCreatedAt || 0));
+    
+    return {
+      success: true,
+      data: pairs.slice(0, limit)
+    };
   }
 }
 

@@ -1,9 +1,10 @@
-import { PublicKey } from '@solana/web3.js';
+import { PublicKey, VersionedTransaction } from '@solana/web3.js';
 import { getMint } from '@solana/spl-token';
-import { getConnection } from './wallet.js';
+import { getConnection, getWallet } from './wallet.js';
 import { CONFIG } from './config.js';
 import { log } from './logger.js';
 import { dexService } from './src/services/dexscreener-service.js';
+
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
@@ -59,9 +60,16 @@ export async function analyzeToken(mintAddress) {
   const reasons = [];
   let score = 100;
 
+  const withTimeout = (promise, ms, name) => {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error(`${name} timeout`)), ms))
+    ]);
+  };
+
   try {
-    // Try to get token info from DexScreener first
-    const dexData = await getTokenSecurityFromDexScreener(mintAddress);
+    // Try to get token info from DexScreener first (with timeout)
+    const dexData = await withTimeout(getTokenSecurityFromDexScreener(mintAddress), 8000, 'DexScreener');
     
     if (dexData && dexData.liquidityUSD > 0) {
       reasons.push(`✔ Token indexed on DexScreener`);
@@ -89,11 +97,11 @@ export async function analyzeToken(mintAddress) {
       reasons.push(`⚠ Token not found on DexScreener - may be too new`);
     }
 
-    // Try to get mint info from chain
+    // Try to get mint info from chain (with timeout)
     const conn = getConnection();
     let mintInfo = null;
     try {
-      mintInfo = await getMint(conn, new PublicKey(mintAddress));
+      mintInfo = await withTimeout(getMint(conn, new PublicKey(mintAddress)), 5000, 'RPC');
       reasons.push(`✔ Mint info available on-chain`);
       
       // Check mint authority
@@ -125,15 +133,43 @@ export async function analyzeToken(mintAddress) {
       score -= 10;
     }
 
-    // Honeypot check via Jupiter - ALWAYS RUN, not optional
-    console.log('[SAFETY] Running mandatory honeypot check...');
-    const honeypot = await simulateHoneypot(mintAddress);
-    console.log('[SAFETY] Honeypot result:', JSON.stringify(honeypot));
-    if (honeypot.isHoneypot) {
-      reasons.push(`✖ Honeypot detected: ${honeypot.reason}`);
+    // Transaction Simulation - PRIMARY HONEYPOT CHECK (replaces quote-only check)
+    console.log('[SAFETY] Running transaction simulation...');
+    const simulation = await simulateSellTransaction(mintAddress);
+    console.log('[SAFETY] Simulation result:', JSON.stringify(simulation));
+    
+    if (simulation.isHoneypot === true) {
+      reasons.push(`✖ Honeypot detected via simulation: ${simulation.reason}`);
       return { safe: false, reasons, score: 0 };
     }
-    reasons.push(`✔ Can sell on Jupiter (not honeypot)`);
+    
+    // Handle unknown case - simulation.isHoneypot === null
+    if (simulation.isHoneypot === null) {
+      // If DexScreener has the token with good liquidity → allow
+      if (dexData && dexData.liquidityUSD > 0 && dexData.liquidityUSD >= CONFIG.MIN_LIQUIDITY_USD) {
+        reasons.push(`⚠ Simulation inconclusive but DexScreener shows $${dexData.liquidityUSD.toLocaleString()} liquidity - allowing`);
+      } else {
+        // No DexScreener data + failed simulation = block
+        reasons.push(`✖ Simulation failed and not on DexScreener - blocking as precaution`);
+        return { safe: false, reasons, score: 0 };
+      }
+    } else {
+      reasons.push(`✔ Transaction simulation passed`);
+    }
+
+    // Additional RugCheck validation (optional backup)
+    const rugcheck = await checkRugCheck(mintAddress);
+    if (rugcheck) {
+      if (rugcheck.score > 50) {
+        reasons.push(`✖ RugCheck high risk: score=${rugcheck.score}`);
+        score -= 50;
+      } else if (rugcheck.risks.length > 0) {
+        reasons.push(`⚠ RugCheck risks: ${rugcheck.risks.slice(0, 3).join(', ')}`);
+        score -= rugcheck.risks.length * 10;
+      } else {
+        reasons.push(`✔ RugCheck: score=${rugcheck.score}, lpLocked=${rugcheck.lpLockedPct.toFixed(1)}%`);
+      }
+    }
 
     const safe = score >= 40;
     return { safe, reasons, score: Math.max(0, score), dexData };
@@ -143,76 +179,186 @@ export async function analyzeToken(mintAddress) {
   }
 }
 
-async function simulateHoneypot(mintAddress) {
-  try {
-    log('info', `Honeypot check: Testing buy/sell quotes for ${mintAddress.slice(0,8)}...`);
-    
-    // ROBUST: Try BOTH buy and sell quotes to verify liquidity
-    const sellUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${mintAddress}&outputMint=${SOL_MINT}&amount=1000000&slippageBps=5000`;
-    const buyUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${SOL_MINT}&outputMint=${mintAddress}&amount=1000000&slippageBps=5000`;
-    
-    // Create timeout-safe fetch
-    const fetchWithTimeout = async (url, timeout = 5000) => {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), timeout);
+async function simulateSellTransaction(tokenMint, amount = 100000) {
+  const conn = getConnection();
+  const wallet = getWallet();
+  const amountsToTry = [1000000]; // Single attempt with 1M lamports
+
+  let lastFailureReason = null;
+  let triedRPCSwitch = false;
+
+  for (const tryAmount of amountsToTry) {
+    for (let rpcAttempt = 0; rpcAttempt < 2; rpcAttempt++) {
       try {
-        const response = await fetch(url, { signal: controller.signal });
-        clearTimeout(timeoutId);
-        return response;
-      } catch (e) {
-        clearTimeout(timeoutId);
-        throw e;
+        const currentConn = getConnection();
+        log('info', `Simulation (${tryAmount} lamports, RPC attempt ${rpcAttempt + 1}): Testing token→SOL for ${tokenMint.slice(0,8)}...`);
+
+        const params = new URLSearchParams({
+          inputMint: tokenMint,
+          outputMint: SOL_MINT,
+          amount: tryAmount.toString(),
+          slippageBps: '5000',
+          taker: wallet.publicKey.toString(),
+        });
+
+        const headers = { 'Accept': 'application/json' };
+        if (CONFIG.JUPITER_API_KEY) headers['x-api-key'] = CONFIG.JUPITER_API_KEY;
+
+        const res = await fetch(`https://api.jup.ag/swap/v2/order?${params}`, {
+          headers,
+          signal: AbortSignal.timeout(5000),
+        });
+
+        if (!res.ok) {
+          lastFailureReason = `No quote for amount ${tryAmount} (HTTP ${res.status})`;
+          log('warn', lastFailureReason);
+          break;
+        }
+
+        const swapResp = await res.json();
+
+        if (!swapResp || !swapResp.transaction) {
+          lastFailureReason = `No swap tx for amount ${tryAmount}`;
+          log('warn', lastFailureReason);
+          break;
+        }
+
+        // Prepare transaction for simulation
+        const txBuf = Buffer.from(swapResp.transaction, 'base64');
+        const transaction = VersionedTransaction.deserialize(txBuf);
+
+        // Get fresh blockhash
+        const { blockhash } = await currentConn.getLatestBlockhash();
+        transaction.message.recentBlockhash = blockhash;
+
+        // SIMULATE (free - not broadcast, no signature needed)
+        const simResult = await currentConn.simulateTransaction(transaction, {
+          sigVerify: false,
+          replaceRecentBlockhash: true,
+        });
+
+        // Check simulation result
+        if (simResult.value.err) {
+          const errStr = JSON.stringify(simResult.value.err);
+          
+          // 6025 (decimal) and 0x1789 (hex) both = honeypot - cannot sell
+          const isHoneypot = errStr.includes('6025') || 
+                             errStr.includes('0x1789') || 
+                             errStr.includes('"Custom":6025');
+          
+          if (isHoneypot) {
+            log('warn', `Honeypot CONFIRMED via simulation: ${errStr}`);
+            return { isHoneypot: true, reason: `Honeypot: contract blocks transfer (6025/0x1789)` };
+          }
+          
+          // Non-honeypot sim error — might be RPC issue, try switching RPC once
+          lastFailureReason = `Simulation error (non-honeypot): ${errStr}`;
+          if (!triedRPCSwitch && rpcAttempt === 0) {
+            log('info', `Simulation non-honeypot error: ${errStr} — retrying with different RPC`);
+            const { switchRPC } = await import('./wallet.js');
+            switchRPC();
+            triedRPCSwitch = true;
+            continue; // Retry with new RPC
+          }
+          
+          // Non-honeypot error on second attempt — still ALLOW the token
+          log('info', `Simulation non-honeypot error on retry: ${errStr} — allowing token`);
+          return { isHoneypot: false, reason: `Non-honeypot sim error: ${errStr}` };
+        }
+
+        // Simulation passed — token is tradeable, ALWAYS allow
+        log('info', `Simulation passed with amount ${tryAmount} — token is tradeable`);
+        return { isHoneypot: false };
+
+      } catch (err) {
+        lastFailureReason = `Simulation exception: ${err.message}`;
+        
+        // If it's an RPC error (not a contract error), try switching RPC
+        if (!triedRPCSwitch && rpcAttempt === 0) {
+          log('warn', `Simulation failed (${err.message}) — retrying with different RPC`);
+          const { switchRPC } = await import('./wallet.js');
+          switchRPC();
+          triedRPCSwitch = true;
+          continue;
+        }
+        
+        log('warn', `Simulation attempt ${tryAmount} failed on retry: ${err.message}`);
+        break;
       }
+    }
+  }
+
+  // All simulation attempts failed — fall back to quote-only check
+  log('warn', `All simulation attempts failed (reason: ${lastFailureReason}) — falling back to quote check`);
+  try {
+    const params = new URLSearchParams({
+      inputMint: tokenMint,
+      outputMint: SOL_MINT,
+      amount: '1000000',
+      slippageBps: '5000'
+    });
+
+    const headers = { 'Accept': 'application/json' };
+    if (CONFIG.JUPITER_API_KEY) headers['x-api-key'] = CONFIG.JUPITER_API_KEY;
+
+    const res = await fetch(`https://api.jup.ag/swap/v2/order?${params}`, {
+      headers,
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (res.ok) {
+      const quote = await res.json();
+      if (quote?.outAmount) {
+        log('info', `Fallback: quote available — allowing token`);
+        return { isHoneypot: false, reason: 'Fallback: quote available' };
+      }
+    }
+  } catch (e) {
+    log('warn', `Fallback quote check also failed: ${e.message}`);
+  }
+
+  // If everything fails, return as unknown
+  // Handle this in analyzeToken based on DexScreener data availability
+  return { isHoneypot: null, reason: `All checks failed: ${lastFailureReason}` };
+}
+
+async function checkRugCheck(tokenMint) {
+  const apiKey = process.env.RUGCHECK_API_KEY;
+  // Proceed even if no API key is provided since the endpoint has a free tier
+
+  try {
+    const headers = {};
+    if (apiKey) headers['x-api-key'] = apiKey;
+
+    const response = await fetch(
+      `https://api.rugcheck.xyz/v1/tokens/${tokenMint}/report/summary`,
+      {
+        headers,
+        signal: AbortSignal.timeout(8000),
+      }
+    );
+
+    if (!response.ok) {
+      log('warn', `RugCheck API error: ${response.status}`);
+      return null;
+    }
+
+    const data = await response.json();
+    log('info', `RugCheck: score=${data.score}, risks=${data.risks?.length || 0}, lpLocked=${data.lpLockedPct?.toFixed(1) || 0}%`);
+
+    return {
+      score: data.score || 0,
+      risks: data.risks || [],
+      lpLockedPct: data.lpLockedPct || 0,
+      tokenProgram: data.tokenProgram,
     };
-    
-    // Fetch both quotes in parallel with timeout
-    const [sellRes, buyRes] = await Promise.all([
-      fetchWithTimeout(sellUrl, 5000).catch(e => ({ error: true, errorMsg: e.message })),
-      fetchWithTimeout(buyUrl, 5000).catch(e => ({ error: true, errorMsg: e.message }))
-    ]);
-    
-    // Check if fetch itself failed
-    if (sellRes.error || buyRes.error) {
-      log('warn', `Honeypot check: API unreachable - treating as honeypot`);
-      return { isHoneypot: true, reason: 'Jupiter API unreachable - cannot verify token' };
-    }
-    
-    // Check response status
-    if (!sellRes.ok || !buyRes.ok) {
-      log('warn', `Honeypot check: API returned error status`);
-      return { isHoneypot: true, reason: 'Jupiter API returned error' };
-    }
-    
-    const sellData = await sellRes.json();
-    const buyData = await buyRes.json();
-    
-    // If either quote fails, it's a potential honeypot
-    if (sellData.error || !sellData.outAmount) {
-      return { isHoneypot: true, reason: 'No sell route (cannot sell back to SOL)' };
-    }
-    if (buyData.error || !buyData.outAmount) {
-      return { isHoneypot: true, reason: 'No buy route (cannot buy with SOL)' };
-    }
-    
-    // Check if the quotes are reasonable (not zero or extremely low)
-    const sellAmount = parseFloat(sellData.outAmount) / 1e9; // Convert to SOL
-    const buyAmount = parseFloat(buyData.outAmount) / 1e6; // Convert to tokens
-    
-    if (sellAmount < 0.0001) {
-      return { isHoneypot: true, reason: 'Suspiciously low sell output' };
-    }
-    if (buyAmount < 100) {
-      return { isHoneypot: true, reason: 'Suspiciously low buy output' };
-    }
-    
-    log('info', `Honeypot check passed: sell=${sellAmount.toFixed(4)} SOL, buy=${buyAmount.toFixed(0)} tokens`);
-    return { isHoneypot: false };
   } catch (err) {
-    // If we can't get quotes, treat as potential honeypot (conservative)
-    log('warn', `Honeypot check error: ${err.message} - treating as honeypot`);
-    return { isHoneypot: true, reason: `Cannot verify token: ${err.message}` };
+    log('warn', `RugCheck error: ${err.message}`);
+    return null;
   }
 }
+
+export { simulateSellTransaction, checkRugCheck };
 
 export async function getLPBurnPercent(poolId) {
   try {

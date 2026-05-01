@@ -6,7 +6,7 @@ import { log } from './logger.js';
 import { getWallet, getSignerWallet, printWalletInfo, getSOLBalance, getVaultBalance, refillSignerFromVault, getSolPrice } from './wallet.js';
 import { PoolMonitor } from './monitor.js';
 import { analyzeToken } from './safety.js';
-import { buyToken } from './executor.js';
+import { buyToken, calculateDynamicSlippage } from './executor.js';
 import { PositionManager } from './positions.js';
 import { PoolService } from './src/services/pool.js';
 import { getTokenPriceInSOL, getPoolLiquidityUSD, getPriceFromPool } from './price.js';
@@ -114,6 +114,12 @@ async function main() {
   let isSwapping = false;
   let buyingTimeout = null;
   const BUY_TIMEOUT_MS = 15000;
+  
+  // Token queue system - batch processing
+  const MAX_QUEUE_SIZE = 4;
+  let tokenQueue = [];         // Discovered tokens waiting for analysis
+  let permanentlyBlocked = new Set(); // Honeypots - never analyze again
+  let isProcessingQueue = false;
 
   function resetBuying() {
     if (buyingTimeout) {
@@ -123,189 +129,171 @@ async function main() {
     isBuying = false;
   }
 
+  // Add token to discovery queue
+  function addToQueue(poolInfo) {
+    const { tokenMint, poolId, liquidityUSD } = poolInfo;
+    
+    // Skip if already in queue or permanently blocked
+    if (permanentlyBlocked.has(tokenMint)) {
+      return false;
+    }
+    if (tokenQueue.find(t => t.tokenMint === tokenMint)) {
+      return false;
+    }
+    
+    // Add to queue if not full
+    if (tokenQueue.length < MAX_QUEUE_SIZE) {
+      tokenQueue.push({ tokenMint, poolId, liquidityUSD, source: poolInfo.source });
+      log('snipe', `[QUEUE] Added ${tokenMint.slice(0,8)}... to queue (${tokenQueue.length}/${MAX_QUEUE_SIZE})`);
+      return true;
+    }
+    return false;
+  }
+
+  // Process the token queue - analyze one at a time
+  async function processQueue() {
+    if (isProcessingQueue || tokenQueue.length === 0) return;
+    if (isBuying || isSwapping) return;
+    if (positions.count() >= CONFIG.MAX_POSITIONS) return;
+    
+    isProcessingQueue = true;
+    
+    while (tokenQueue.length > 0 && !isBuying && !isSwapping && positions.count() < CONFIG.MAX_POSITIONS) {
+      const current = tokenQueue.shift();
+      const { tokenMint, poolId, liquidityUSD } = current;
+      
+      log('snipe', `[QUEUE] Processing ${tokenMint.slice(0,8)}... (${tokenQueue.length} remaining)`);
+      
+      // Analyze this token
+      const analysis = await analyzeToken(tokenMint);
+      
+      if (!analysis.safe) {
+        // Permanently block honeypots
+        permanentlyBlocked.add(tokenMint);
+        log('warn', `[QUEUE] ❌ ${tokenMint.slice(0,8)}... is honeypot - permanently blocked`);
+        continue; // Move to next in queue
+      }
+      
+      if (analysis.score < 40) {
+        permanentlyBlocked.add(tokenMint);
+        log('warn', `[QUEUE] ❌ ${tokenMint.slice(0,8)}... score too low - permanently blocked`);
+        continue; // Move to next in queue
+      }
+      
+      // Token is SAFE - proceed to buy
+      log('info', `[QUEUE] ✅ ${tokenMint.slice(0,8)}... passed security checks!`);
+      
+      const signerBalance = await getSOLBalance();
+      const vaultBalance = await getVaultBalance();
+      const totalBalance = signerBalance + vaultBalance;
+      const closedPnL = positions.getTotalClosedPnL();
+      const buyAmount = CONFIG.USE_GRADUATED_SCALING 
+        ? getDynamicBuyAmount(totalBalance, CONFIG._solPrice || 90, vaultBalance, closedPnL)
+        : CONFIG.BUY_AMOUNT_SOL;
+      
+      if (totalBalance < buyAmount + 0.005) {
+        log('warn', `[QUEUE] Insufficient balance - clearing queue`);
+        tokenQueue = [];
+        break;
+      }
+      
+      // Execute buy
+      isBuying = true;
+      isSwapping = true;
+      buyingTimeout = setTimeout(() => {
+        if (isBuying) {
+          log('warn', 'Buy timeout - resetting');
+          resetBuying();
+        }
+      }, BUY_TIMEOUT_MS);
+      
+      try {
+        // Vault → Signer: refill signer before buy (per flowchart)
+        const refillResult = await refillSignerFromVault();
+        if (refillResult.success && refillResult.reason !== 'sufficient_balance') {
+          log('info', `[QUEUE] Vault → Signer refill completed`);
+        }
+        
+        log('info', `[QUEUE] 🎯 Executing buy: ${buyAmount.toFixed(6)} SOL`);
+        
+        let slippageBps = CONFIG.SLIPPAGE_PERCENT * 100;
+        if (liquidityUSD) {
+          slippageBps = calculateDynamicSlippage(liquidityUSD) * 100;
+          log('info', `[QUEUE] Using dynamic slippage based on $${Math.round(liquidityUSD)} liquidity: ${slippageBps/100}%`);
+        }
+        
+        const result = await buyToken(tokenMint, buyAmount, poolId, slippageBps);
+        
+        if (!result.success) {
+          log('error', `[QUEUE] Buy failed: ${result.error}`);
+          permanentlyBlocked.add(tokenMint); // Block on buy failure too
+          isSwapping = false;
+          resetBuying();
+          continue;
+        }
+        
+        log('info', `[QUEUE] ✅ Buy confirmed: ${result.tokenAmount?.toFixed(2)} tokens`);
+        
+        await positions.add(tokenMint, {
+          tokenAmount: result.tokenAmount,
+          pricePerToken: result.pricePerToken,
+          solSpent: result.solSpent,
+          poolId,
+        });
+        
+        sendAlert('buy', {
+          mint: tokenMint,
+          solSpent: result.solSpent,
+          pricePerToken: result.pricePerToken,
+        });
+        
+        // Clear queue after successful buy
+        tokenQueue = [];
+        log('info', `[QUEUE] 🧹 Queue cleared after successful buy`);
+        
+        // Reset buying IMMEDIATELY on success (prevents false timeout warning)
+        isSwapping = false;
+        resetBuying();
+        
+      } catch (err) {
+        log('error', `[QUEUE] Buy error: ${err.message}`);
+        isSwapping = false;
+        resetBuying();
+      }
+    }
+    
+    isProcessingQueue = false;
+  }
+
   // ─── New pool handler ───────────────────────────────────────────────────
   monitor.on('newPool', async (poolInfo) => {
     const { tokenMint, poolId, liquidityUSD } = poolInfo;
 
     // Guard 1: Max positions check FIRST
     if (positions.count() >= CONFIG.MAX_POSITIONS) {
-      if (positions.count() < CONFIG.MAX_POSITIONS) {
-        log('snipe', `New pool: ${tokenMint.slice(0, 12)}...  Pool: ${poolId.slice(0, 8)}...`);
-      }
-      log('info', `⚠ Max positions (${CONFIG.MAX_POSITIONS}) — monitoring but NOT buying new tokens`);
+      log('info', `⚠ Max positions (${CONFIG.MAX_POSITIONS}) — monitoring only`);
       return;
     }
 
-    // Log new pool (we're under max)
-    log('snipe', `New pool: ${tokenMint.slice(0, 12)}...  Pool: ${poolId.slice(0, 8)}...`);
-
-    // Guard 2: Prevent re-buying existing positions
-    if (positions.get(tokenMint) && positions.get(tokenMint).status === 'open') {
-      log('warn', `Already have position for ${tokenMint.slice(0, 8)}... — skipping`);
+    // Guard 2: Skip if position already open for this mint
+    if (positions.get(tokenMint)?.status === 'open') {
       return;
     }
 
-    if (isBuying) {
-      log('warn', `Already buying — skipping`);
-      return;
-    }
-    if (isSwapping) {
-      log('warn', 'Transaction already in progress...');
-      return;
-    }
-    isBuying = true;
-    buyingTimeout = setTimeout(() => {
-      if (isBuying) {
-        log('warn', 'Buy timeout - resetting lock');
-        resetBuying();
-      }
-    }, BUY_TIMEOUT_MS);
-
-    // Start monitoring if not already
-    if (!monitor.isListening()) {
-      await monitor.start();
-      log('info', 'Started pool monitoring');
-    }
-
-    const signerBalance = await getSOLBalance();
-    const vaultBalance = await getVaultBalance();
-    const totalBalance = signerBalance + vaultBalance;
-    
-    const closedPnL = positions.getTotalClosedPnL();
-    const effectiveVault = vaultBalance + closedPnL;
-    
-    const buyAmount = CONFIG.USE_GRADUATED_SCALING 
-      ? getDynamicBuyAmount(totalBalance, CONFIG._solPrice || 90, vaultBalance, closedPnL)
-      : CONFIG.BUY_AMOUNT_SOL;
-    
-    const compundingMsg = closedPnL !== 0 ? ` (+${closedPnL.toFixed(4)} profit)` : '';
-    log('info', `💰 Balance: ${totalBalance.toFixed(4)} SOL (S:${signerBalance.toFixed(3)} V:${vaultBalance.toFixed(3)}${compundingMsg}) | Buy: ${buyAmount.toFixed(6)} SOL`);
-    
-    if (totalBalance < buyAmount + 0.005) {
-      log('warn', `Insufficient balance: ${totalBalance.toFixed(4)} SOL (need ${buyAmount.toFixed(4)} SOL)`);
-      resetBuying();
+    // Skip if permanently blocked
+    if (permanentlyBlocked.has(tokenMint)) {
       return;
     }
 
-    // Unified liquidity check via PoolService
-    const poolState = await PoolService.getPoolState(poolId, tokenMint);
-    const finalLiquidity = poolState.tvlUSD || liquidityUSD || 0;
-    
-    log('info', `Pool liquidity: $${finalLiquidity.toLocaleString()} (${poolState.program})`);
-    
-    // FIXED: Remove > 0 check, add SOL liquidity validation
-    if (finalLiquidity < CONFIG.MIN_LIQUIDITY_USD) {
-      log('warn', `Liquidity too low: $${finalLiquidity}`);
-      resetBuying();
+    // Add to queue instead of analyzing immediately
+    const added = addToQueue(poolInfo);
+    if (!added && tokenQueue.length >= MAX_QUEUE_SIZE) {
+      log('snipe', `[QUEUE] Queue full (${MAX_QUEUE_SIZE}) - waiting for analysis to complete`);
       return;
     }
     
-    // Check SOL liquidity via Jupiter quote (skip in paper mode)
-    if (!CONFIG.PAPER_TRADING) {
-      try {
-        const { jupiterApi } = await import('./src/jupiter-client.js');
-        const { LAMPORTS_PER_SOL } = await import('./src/jupiter-client.js');
-        const solQuote = await jupiterApi.quoteGet({
-          inputMint: 'So11111111111111111111111111111111111112',
-          outputMint: tokenMint,
-          amount: Math.floor(0.001 * LAMPORTS_PER_SOL),
-          slippageBps: 5000,
-        });
-        
-        if (!solQuote || !solQuote.outAmount) {
-          log('warn', `No SOL liquidity route for ${tokenMint.slice(0,8)}... — skipping`);
-          resetBuying();
-          return;
-        }
-        
-        const tokenReceived = Number(solQuote.outAmount);
-        log('info', `SOL liquidity confirmed: ~${tokenReceived} tokens per 0.001 SOL`);
-      } catch (err) {
-        log('warn', `SOL liquidity check failed: ${err.message} — continuing anyway`);
-        // Don't skip trade - continue with DexScreener/fallback price
-      }
-    } else {
-      log('info', `SOL liquidity check skipped (PAPER_TRADING)`);
-    }
-    
-    // Get price from price.js (with estimated fallback)
-    log('info', `Fetching price for ${tokenMint.slice(0,8)}... pool: ${poolId}`);
-    let currentPrice = await getTokenPriceInSOL(tokenMint, poolId);
-    if (!currentPrice) {
-      currentPrice = 0.000001;
-      log('warn', `Price lookup failed - using liquidity-based estimate`);
-      log('info', `Using estimated entry price: ${currentPrice.toExponential(4)} SOL`);
-    }
-    log('info', `Current price: ${currentPrice.toExponential(4)} SOL`);
-
-    // Token security analysis via PoolService
-    log('info', `Analyzing token safety: ${tokenMint.slice(0, 12)}...`);
-    const security = await PoolService.getTokenSecurity(tokenMint);
-
-    if (security.isHoneypot) {
-      log('warn', `✖ Honeypot detected: ${security.honeypotReason}`);
-      resetBuying();
-      return;
-    }
-
-    if (security.mintAuthority) {
-      log('info', `  ⚠ Mint authority NOT revoked - can print tokens`);
-    }
-
-    if (security.liquidityUSD > 0) {
-      log('info', `  ✔ DexScreener liquidity: $${security.liquidityUSD.toLocaleString()}`);
-    }
-
-    const safetyScore = calculateSafetyScore(security);
-    log('success', `Safety score: ${safetyScore}/100 — SNIPING 🚀`);
-
-    if (safetyScore < 40) {
-      log('warn', `Token failed safety check`);
-      resetBuying();
-      return;
-    }
-
-    if (!CONFIG.PAPER_TRADING) {
-      const refill = await refillSignerFromVault();
-      if (!refill.success) {
-        log('warn', `Signer refill failed: ${refill.reason}`);
-        if (refill.reason === 'vault_low') {
-          sendAlert('error', { message: 'Vault balance too low for refill' });
-          resetBuying();
-          return;
-        }
-      }
-    }
-
-    isSwapping = true;
-    try {
-      const result = await buyToken(tokenMint, buyAmount, poolId);
-
-      if (!result.success) {
-        log('error', `Buy failed: ${result.error}`);
-        resetBuying();
-        return;
-      }
-
-      await positions.add(tokenMint, {
-        tokenAmount: result.tokenAmount,
-        pricePerToken: result.pricePerToken,
-        solSpent: result.solSpent,
-        poolId,
-      });
-
-      sendAlert('buy', {
-        mint: tokenMint,
-        solSpent: result.solSpent,
-        pricePerToken: result.pricePerToken,
-      });
-
-    } catch (err) {
-      log('error', `Buy error: ${err.message}`);
-    } finally {
-      isSwapping = false;
-      resetBuying();
-    }
+// Try to process queue
+    await processQueue();
   });
 
   function calculateSafetyScore(security) {
@@ -322,33 +310,40 @@ async function main() {
   let lastMonitoredPrices = {};
   let isMonitoring = false;
   let lastRetryTime = 0;
+  let _pollCounter = 0;
   
   setInterval(async () => {
+    _pollCounter++;
     // PREVENT OVERLAPPING EXECUTIONS
     if (isMonitoring) return;
     isMonitoring = true;
     
     try {
-      // Resume pool monitoring when positions < MAX_POSITIONS (has vacant slots)
-      if (positions.count() < CONFIG.MAX_POSITIONS) {
-        if (!monitor.isListening()) {
-          await monitor.start();
-          log('info', '══════════════════════════════════════════');
-          log('info', `  🎯 DISCOVERY MODE — Scanning for new pools`);
-          log('info', '══════════════════════════════════════════');
-        }
+      // Keep monitoring ALWAYS active - PUMP + L3 don't stop
+      if (!monitor.isListening()) {
+        await monitor.start();
+        log('info', '══════════════════════════════════════════');
+        log('info', `  🎯 DISCOVERY MODE — Scanning for new pools`);
+        log('info', '══════════════════════════════════════════');
       }
       
-      // If all positions full, stop DISCOVERY only (not monitoring)
-      if (positions.count() >= CONFIG.MAX_POSITIONS && monitor.isListening()) {
-        await monitor.stop();
+      // Log status if at max positions
+      if (positions.count() >= CONFIG.MAX_POSITIONS) {
+        if (_pollCounter % 6 === 0) {
+          log('info', `  ⚠️ Max positions (${CONFIG.MAX_POSITIONS}) — scanning but NOT buying`);
+        }
       }
     
-    // Show monitoring header (only when positions open)
+// Show monitoring header (only when positions open)
     if (positions.count() > 0) {
-      log('info', '══════════════════════════════════════════');
+      log('info', '══════════════════════════════════════════════════');
       log('info', `  🔍 MONITORING ${positions.count()} position(s) - TP/SL checks active`);
-      log('info', '══════════════════════════════════════════');
+      log('info', '══════════════════════════════════════════════════');
+    } else {
+      // Heartbeat when no positions - show bot is still scanning
+      if (_pollCounter % 6 === 0) { // Every ~30 seconds
+        log('info', `  ⏳ Waiting for new pools... (scanning)`);
+      }
     }
     
     // Check positions and track price changes + execute TP/SL

@@ -1,13 +1,14 @@
-import { sellToken } from './executor.js';
+import { sellToken, calculateDynamicSlippage } from './executor.js';
 import { CONFIG } from './config.js';
 import { log } from './logger.js';
 import { sendAlert } from './telegram.js';
 import { PoolService } from './src/services/pool.js';
-import { jupiterApi } from './src/jupiter-client.js';
+
 import { LAMPORTS_PER_SOL } from '@solana/web3.js';
 import fs from 'fs';
 
 const POSITIONS_FILE = './logs/positions.json';
+import { getPoolLiquidityUSD } from './price.js';
 
 export class PositionManager {
   constructor() {
@@ -25,20 +26,24 @@ export class PositionManager {
   async clearStalePositions() {
     const now = Date.now();
     const maxAge = (CONFIG.MAX_HOLD_MINUTES || 15) * 60 * 1000;
+    // Only handle positions that are clearly stale from a previous session
+    // (runtime time exits are handled exclusively by checkAll)
+    const BOOT_GRACE_MS = 5000; // 5s after boot — anything older is from previous run
 
     for (const [mint, pos] of this.positions) {
       if (pos.status !== 'open') continue;
 
       const age = now - pos.openedAt;
-      if (age < maxAge) continue;
+      // Skip if position is newer than maxAge + grace (will be handled by checkAll)
+      if (age < maxAge + BOOT_GRACE_MS) continue;
 
-      log('warn', `Stale position: ${mint.slice(0,8)}... (${Math.round(age/60000)}m old)`);
+      log('warn', `Stale position from previous session: ${mint.slice(0,8)}... (${Math.round(age/60000)}m old)`);
 
       // PAPER MODE: Skip Jupiter API call
       if (CONFIG.PAPER_TRADING) {
         pos.status = 'closed';
         pos.closedAt = Date.now();
-        pos.closeReason = 'stale';
+        pos.closeReason = 'stale_startup';
         pos.pnlSOL = 0;
         this._save();
         log('success', `Closed stale position (paper): ${mint.slice(0,8)}...`);
@@ -46,12 +51,21 @@ export class PositionManager {
       }
 
       try {
-        const quote = await jupiterApi.quoteGet({
+        const params = new URLSearchParams({
           inputMint: mint,
-          outputMint: 'So11111111111111111111111111111111111112',
-          amount: Math.floor(pos.tokenAmountOriginal - pos.totalSoldAmount),
-          slippageBps: 1000,
+          outputMint: 'So11111111111111111111111111111111111111112', // Note: Make sure address is correct
+          amount: Math.floor(pos.tokenAmountOriginal - pos.totalSoldAmount).toString(),
+          slippageBps: '1000'
         });
+
+        const headers = { 'Accept': 'application/json' };
+        if (CONFIG.JUPITER_API_KEY) headers['x-api-key'] = CONFIG.JUPITER_API_KEY;
+
+        const res = await fetch(`https://api.jup.ag/swap/v2/order?${params}`, {
+          headers,
+          signal: AbortSignal.timeout(5000),
+        });
+        const quote = res.ok ? await res.json() : null;
 
         if (quote?.outAmount) {
           const solReceived = Number(quote.outAmount) / LAMPORTS_PER_SOL;
@@ -138,14 +152,11 @@ export class PositionManager {
 
         const pnlPercent = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
 
-        // DEBUG: Log price comparison
         const slPercent = CONFIG.STOP_LOSS_PERCENT;
         const actualSL = pos.entryPrice * (1 - slPercent / 100);
         
-        // Fix: Stop loss should trigger when price goes DOWN, not up
-        // Also add small buffer to avoid floating point issues
-        const isStopLoss = currentPrice < actualSL && pnlPercent < -slPercent;
-        const isTakeProfit = currentPrice > pos.entryPrice && pnlPercent > 0;
+        // Stop loss: single clean condition — price dropped below threshold
+        const isStopLoss = currentPrice < actualSL;
 
         if (isStopLoss) {
           log('warn', `🛑 STOP LOSS on ${mint.slice(0, 8)}... (entry: ${pos.entryPrice.toExponential(3)}, current: ${currentPrice.toExponential(3)}, SL: ${actualSL.toExponential(3)})`);
@@ -159,10 +170,17 @@ export class PositionManager {
           const targetPrice = pos.entryPrice * CONFIG.INSTANT_TP_MULTIPLIER;
           if (currentPrice >= targetPrice) {
             log('success', `🎯 INSTANT SELL (${CONFIG.INSTANT_TP_MULTIPLIER}x) on ${mint.slice(0,8)}... (+${pnlPercent.toFixed(1)}%)`);
-            const result = await sellToken(mint, pos.tokenAmountOriginal - pos.totalSoldAmount);
+            let sellSlippageBps = CONFIG.SLIPPAGE_PERCENT * 100;
+            try {
+              const liqUSD = await getPoolLiquidityUSD(pos.poolId);
+              if (liqUSD > 0) sellSlippageBps = calculateDynamicSlippage(liqUSD) * 100;
+            } catch (e) {}
+            const result = await sellToken(mint, pos.tokenAmountOriginal - pos.totalSoldAmount, sellSlippageBps);
             const solReceived = result.solReceived || 0;
             pos.pnlSOL = (pos.pnlSOL || 0) + (solReceived - pos.solSpentOriginal);
             pos.totalSoldPercent = 100;
+            pos.totalSoldAmount = pos.tokenAmountOriginal;
+            pos.tokenAmount = 0; // CRITICAL: prevent double-sell
             await this._closeFully(mint, pos, 'take_profit');
             sendAlert('sell_tp', { mint, profitPercent: pnlPercent, pnlSol: pos.pnlSOL });
             continue;
@@ -181,7 +199,12 @@ export class PositionManager {
               
               log('success', `🎯 TP ${stage.multiplier}x (${sellPercent}%) on ${mint.slice(0, 8)}... (+${pnlPercent.toFixed(1)}%)`);
               
-              const result = await sellToken(mint, sellAmount);
+              let sellSlippageBps = CONFIG.SLIPPAGE_PERCENT * 100;
+              try {
+                const liqUSD = await getPoolLiquidityUSD(pos.poolId);
+                if (liqUSD > 0) sellSlippageBps = calculateDynamicSlippage(liqUSD) * 100;
+              } catch (e) {}
+              const result = await sellToken(mint, sellAmount, sellSlippageBps);
               
               stage.sold = true;
               pos.totalSoldPercent += sellPercent;
@@ -239,11 +262,19 @@ export class PositionManager {
     const remainingTokens = pos.tokenAmount;
     
     if (remainingTokens > 0) {
-      const result = await sellToken(mintAddress, remainingTokens);
+      let sellSlippageBps = CONFIG.SLIPPAGE_PERCENT * 100;
+      try {
+        const liqUSD = await getPoolLiquidityUSD(pos.poolId);
+        if (liqUSD > 0) sellSlippageBps = calculateDynamicSlippage(liqUSD) * 100;
+      } catch (e) {}
+      const result = await sellToken(mintAddress, remainingTokens, sellSlippageBps);
       
       // VERIFY SELL SUCCESS BEFORE MARKING CLOSED
       if (!result.success) {
         log('error', `Sell failed for ${mintAddress.slice(0,8)}... - keeping position open. Error: ${result.error}`);
+        // Mark for retry so retryFailedCloses() can pick it up
+        pos._closeFailed = true;
+        this._save();
         // Don't close position - keep it open for retry
         return;
       }
@@ -267,7 +298,12 @@ export class PositionManager {
     
     if (pos.tokenAmount > 0) {
       // Try to sell remaining tokens first
-      const result = await sellToken(mintAddress, pos.tokenAmount);
+      let sellSlippageBps = CONFIG.SLIPPAGE_PERCENT * 100;
+      try {
+        const liqUSD = await getPoolLiquidityUSD(pos.poolId);
+        if (liqUSD > 0) sellSlippageBps = calculateDynamicSlippage(liqUSD) * 100;
+      } catch (e) {}
+      const result = await sellToken(mintAddress, pos.tokenAmount, sellSlippageBps);
       
       if (!result.success) {
         log('error', `Cannot close position - sell failed: ${result.error}. Position remains open.`);
@@ -291,9 +327,10 @@ export class PositionManager {
     let retried = 0;
     
     for (const [mint, pos] of openPositions) {
-      // Check if position has tokens that need selling but wasn't closed
-      if (pos.tokenAmount > 0 && pos.status === 'open') {
-        log('info', `Retrying close for ${mint.slice(0,8)}...`);
+      // ONLY retry positions that previously failed to close (not ALL open positions)
+      if (pos._closeFailed && pos.tokenAmount > 0 && pos.status === 'open') {
+        log('info', `Retrying failed close for ${mint.slice(0,8)}...`);
+        pos._closeFailed = false; // Clear flag before retry
         await this.closePosition(mint, 'retry_close');
         retried++;
       }

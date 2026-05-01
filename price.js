@@ -2,10 +2,15 @@ const PRICE_CACHE = new Map();
 const CACHE_TTL   = 5000;
 
 /**
- * Get current token price in SOL via Jupiter Price API v2
+ * Get current token price in SOL via multiple price sources.
+ * Fallback chain: DexScreener → Jupiter Price v2 → RPC vault calc → Raydium v3 → (Birdeye removed)
  */
 import { getConnection } from './wallet.js';
 import { PublicKey } from '@solana/web3.js';
+import { dexService } from './src/services/dexscreener-service.js';
+
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
+const JUPITER_PRICE_V3 = 'https://api.jup.ag/price/v3';
 
 export async function getTokenPriceInSOL(mintAddress, poolId = null) {
   const cacheKey = poolId || mintAddress;
@@ -14,45 +19,30 @@ export async function getTokenPriceInSOL(mintAddress, poolId = null) {
     return cached.price;
   }
 
-  // Try DexScreener first - returns priceNative in SOL
+  // 1. Primary: DexScreener - returns priceNative in SOL
   const dexPrice = await getPriceFromDexscreener(mintAddress);
   if (dexPrice) {
     PRICE_CACHE.set(cacheKey, { price: dexPrice, ts: Date.now() });
     return dexPrice;
   }
 
-  // Try Jupiter first - get USD price and convert to SOL
-  let solPriceUSD = null;
-  try {
-    const solUrl = 'https://price.jup.ag/v6/price?ids=So11111111111111111111111111111111111111112';
-    const solRes = await fetch(solUrl, { signal: AbortSignal.timeout(5000) });
-    const solData = await solRes.json();
-    solPriceUSD = solData?.data?.['So11111111111111111111111111111111111111112']?.price || null;
-  } catch {}
+  // 2. Secondary: Jupiter Price API v2 (replaced deprecated v6)
+  const jupPrice = await getJupiterPriceInSOL(mintAddress);
+  if (jupPrice) {
+    PRICE_CACHE.set(cacheKey, { price: jupPrice, ts: Date.now() });
+    return jupPrice;
+  }
 
-  try {
-    const url  = `https://price.jup.ag/v6/price?ids=${mintAddress}`;
-    const res  = await fetch(url, { signal: AbortSignal.timeout(5000) });
-    const data = await res.json();
-    const usdPrice = data?.data?.[mintAddress]?.price || null;
-
-    if (usdPrice && solPriceUSD) {
-      const priceInSOL = usdPrice / solPriceUSD;
-      PRICE_CACHE.set(cacheKey, { price: priceInSOL, ts: Date.now() });
-      return priceInSOL;
-    }
-  } catch {}
-
-  // Try get price from pool account via RPC (most reliable for new tokens)
+  // 3. Tertiary: RPC vault calc (most reliable for new tokens with known pool)
   if (poolId) {
     const price = await getPriceFromPoolRPC(poolId);
-    if (price && price > 0 && price < 100) { // Accept prices up to 100 SOL (very high cap)
+    if (price && price > 0 && price < 100) {
       PRICE_CACHE.set(cacheKey, { price, ts: Date.now() });
       return price;
     }
   }
 
-  // Try Raydium API pool price with retries
+  // 4. Quaternary: Raydium v3 API
   if (poolId) {
     const price = await getPriceFromPool(poolId, 2, 2000);
     if (price && price > 0 && price < 100) {
@@ -60,7 +50,6 @@ export async function getTokenPriceInSOL(mintAddress, poolId = null) {
       return price;
     }
     
-    // Try CPMM calculation from on-chain data
     const cpmmPrice = await getCPMMPriceFromPool(poolId);
     if (cpmmPrice && cpmmPrice > 0 && cpmmPrice < 100) {
       PRICE_CACHE.set(cacheKey, { price: cpmmPrice, ts: Date.now() });
@@ -68,8 +57,58 @@ export async function getTokenPriceInSOL(mintAddress, poolId = null) {
     }
   }
 
-  // Fallback: search Raydium pools
+  // 5. Last resort: search Raydium pools by mint
   return await getPriceFromRaydium(mintAddress);
+}
+
+/**
+ * Get token price in SOL using Jupiter Price API v2.
+ * Replaces deprecated price.jup.ag/v6.
+ */
+async function getJupiterPriceInSOL(mintAddress) {
+  try {
+    // Jupiter v2 supports vsToken parameter for direct SOL-denominated price
+    const url = `${JUPITER_PRICE_V3}?ids=${mintAddress}&vsToken=${SOL_MINT}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    const data = await res.json();
+    // V3 uses direct mint properties and usdPrice/price
+    const price = data?.[mintAddress]?.price || data?.[mintAddress]?.usdPrice;
+    if (price && price > 0) {
+      return parseFloat(price);
+    }
+  } catch {}
+
+  // Fallback: get both USD prices and divide
+  try {
+    const [tokenRes, solRes] = await Promise.all([
+      fetch(`${JUPITER_PRICE_V3}?ids=${mintAddress}`, { signal: AbortSignal.timeout(5000) }),
+      fetch(`${JUPITER_PRICE_V3}?ids=${SOL_MINT}`, { signal: AbortSignal.timeout(5000) }),
+    ]);
+    const [tokenData, solData] = await Promise.all([tokenRes.json(), solRes.json()]);
+    const tokenUSD = tokenData?.[mintAddress]?.price || tokenData?.[mintAddress]?.usdPrice;
+    const solUSD = solData?.[SOL_MINT]?.price || solData?.[SOL_MINT]?.usdPrice;
+    if (tokenUSD && solUSD && solUSD > 0) {
+      return parseFloat(tokenUSD) / parseFloat(solUSD);
+    }
+  } catch {}
+
+  return null;
+}
+
+/**
+ * Get SOL price in USD using Jupiter Price v2.
+ */
+async function getSOLPriceUSD() {
+  try {
+    const res = await fetch(`${JUPITER_PRICE_V3}?ids=${SOL_MINT}`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    const data = await res.json();
+    const price = data?.[SOL_MINT]?.price || data?.[SOL_MINT]?.usdPrice;
+    return parseFloat(price) || 140;
+  } catch {
+    return 140;
+  }
 }
 
 async function getPriceFromPoolRPC(poolId) {
@@ -81,18 +120,13 @@ async function getPriceFromPoolRPC(poolId) {
     if (!accountInfo?.data) return null;
     
     const data = accountInfo.data;
-    const DISCRIMINATOR_LEN = 8;
     const PUBKEY_LEN = 32;
     
     // Raydium V4/CLOBBER/METEORA pool structure
-    // After discriminator: baseVault(32) + quoteVault(32) + ...
-    // We need to find the vault offsets which vary by pool type
-    
-    // Try standard Raydium V4 offset pattern
     const offsets = [
       { base: 72, quote: 104 },   // Standard V4
-      { base: 64, quote: 96 },   // Alternative
-      { base: 40, quote: 72 },   // CLMM
+      { base: 64, quote: 96 },    // Alternative
+      { base: 40, quote: 72 },    // CLMM
     ];
     
     for (const offset of offsets) {
@@ -116,7 +150,7 @@ async function getPriceFromPoolRPC(poolId) {
         
         if (baseAmount > 0n && quoteAmount > 0n) {
           const price = Number(quoteAmount) / Number(baseAmount);
-          if (price > 0 && price < 1000000) { // Allow very small token prices
+          if (price > 0 && price < 1000000) {
             return price;
           }
         }
@@ -132,8 +166,6 @@ async function getPriceFromPoolRPC(poolId) {
 }
 
 export async function getPriceFromPool(poolId, retries = 3, delayMs = 3000) {
-  const SOL_MINT = 'So11111111111111111111111111111111111111112';
-  
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       const res = await fetch(`https://api-v3.raydium.io/pools/info/ids?ids=${poolId}`, {
@@ -150,14 +182,8 @@ export async function getPriceFromPool(poolId, retries = 3, delayMs = 3000) {
         return null;
       }
       
-      // Convert USD to SOL
-      let solUSD = 140;
-      try {
-        const solRes = await fetch(`https://price.jup.ag/v6/price?ids=${SOL_MINT}`, { signal: AbortSignal.timeout(3000) });
-        const solData = await solRes.json();
-        solUSD = solData?.data?.[SOL_MINT]?.price || 140;
-      } catch {}
-      
+      // Convert USD to SOL using Jupiter v2
+      const solUSD = await getSOLPriceUSD();
       return usdPrice / solUSD;
     } catch {
       if (attempt < retries - 1) {
@@ -173,7 +199,6 @@ export async function getCPMMPriceFromPool(poolId) {
     const conn = getConnection();
     const poolPubkey = new PublicKey(poolId);
     const RAYDIUM_PROGRAM = new PublicKey('675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8');
-    const SOL_MINT = 'So11111111111111111111111111111111111111112';
     
     const seedVariations = [
       ['vault_a', 'vault_b'],
@@ -226,7 +251,6 @@ export async function getCPMMPriceFromPool(poolId) {
 }
 
 async function getPriceFromRaydium(mintAddress) {
-  const SOL_MINT = 'So11111111111111111111111111111111111111112';
   try {
     const res = await fetch(
       `https://api-v3.raydium.io/pools/info/mint?mint1=${mintAddress}&mint2=${SOL_MINT}&poolType=all&poolSortField=liquidity&sortType=desc&pageSize=20&page=1`,
@@ -235,19 +259,14 @@ async function getPriceFromRaydium(mintAddress) {
     const data = await res.json();
     const pools = data?.data || [];
     
-    // Get SOL price for conversion
-    let solUSD = 140;
-    try {
-      const solRes = await fetch('https://price.jup.ag/v6/price?ids=So11111111111111111111111111111111111111112', { signal: AbortSignal.timeout(3000) });
-      const solData = await solRes.json();
-      solUSD = solData?.data?.['So11111111111111111111111111111111111111112']?.price || 140;
-    } catch {}
+    // Get SOL price for conversion (using v2 API)
+    const solUSD = await getSOLPriceUSD();
     
     for (const pool of pools) {
       const usdPrice = parseFloat(pool.price || 0);
       if (usdPrice > 0) {
         const priceInSOL = usdPrice / solUSD;
-        if (priceInSOL > 0 && priceInSOL < 1) { // Sanity check
+        if (priceInSOL > 0 && priceInSOL < 1) {
           PRICE_CACHE.set(mintAddress, { price: priceInSOL, ts: Date.now() });
           return priceInSOL;
         }
@@ -255,43 +274,21 @@ async function getPriceFromRaydium(mintAddress) {
     }
     return null;
   } catch {
+    // Final fallback: DexScreener (retry if not tried yet)
     try { return await getPriceFromDexscreener(mintAddress); } catch {}
-    try { return await getPriceFromBirdeye(mintAddress); } catch {}
     return null;
   }
 }
 
 async function getPriceFromDexscreener(mintAddress) {
   try {
-    const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mintAddress}`, {
-      signal: AbortSignal.timeout(8000)
-    });
-    const data = await res.json();
-    const pair = data?.pairs?.[0];
-    if (pair?.priceNative) {
-      const price = parseFloat(pair.priceNative);
+    const result = await dexService.getTokenPrice(mintAddress);
+    if (result.success && result.data?.priceNative) {
+      const price = result.data.priceNative;
       if (price > 0) {
         PRICE_CACHE.set(mintAddress, { price, ts: Date.now() });
         return price;
       }
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-async function getPriceFromBirdeye(mintAddress) {
-  try {
-    const res = await fetch(`https://public-api.birdeye.com/defi/price?address=${mintAddress}`, {
-      signal: AbortSignal.timeout(8000),
-      headers: { 'Accept': 'application/json' }
-    });
-    const data = await res.json();
-    const price = parseFloat(data?.data?.value);
-    if (price > 0) {
-      PRICE_CACHE.set(mintAddress, { price, ts: Date.now() });
-      return price;
     }
     return null;
   } catch {

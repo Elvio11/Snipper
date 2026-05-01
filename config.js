@@ -11,22 +11,30 @@ export const CONFIG = {
   TELEGRAM_BOT_TOKEN:        process.env.TELEGRAM_BOT_TOKEN || '',
   TELEGRAM_CHAT_ID:          process.env.TELEGRAM_CHAT_ID || '',
 
-  // RPC
+  // RPC & API Keys
   RPC_URL:                   process.env.RPC_URL || 'https://api.mainnet-beta.solana.com',
   RPC_URL_FALLBACK:          process.env.RPC_URL_FALLBACK || 'https://api.mainnet-beta.solana.com',
   HELIUS_API_KEY:            process.env.HELIUS_API_KEY || '',
+  JUPITER_API_KEY:           process.env.JUPITER_API_KEY || '',  // Optional: from developers.jup.ag/portal (keyless=0.5 RPS, free=1 RPS)
 
   // Trade controls
   BUY_AMOUNT_SOL:            parseFloat(process.env.BUY_AMOUNT_SOL || '0.01'),
-  TAKE_PROFIT_MULTIPLIER:    parseFloat(process.env.TAKE_PROFIT_MULTIPLIER || '1.2'),
-  STOP_LOSS_PERCENT:         parseFloat(process.env.STOP_LOSS_PERCENT || '20'),
+  TAKE_PROFIT_MULTIPLIER:    parseFloat(process.env.TAKE_PROFIT_MULTIPLIER || '1.35'),
+  STOP_LOSS_PERCENT:         parseFloat(process.env.STOP_LOSS_PERCENT || '15'),
   SLIPPAGE_PERCENT:          parseFloat(process.env.SLIPPAGE_PERCENT || '10'),
   MAX_POSITIONS:             parseInt(process.env.MAX_POSITIONS || '3'),
 
   // Sell strategy
   SELL_MODE:                process.env.SELL_MODE || 'instant',  // 'instant' (100% at TP) or 'staged' (keep 50/50)
-  INSTANT_TP_MULTIPLIER:     parseFloat(process.env.INSTANT_TP_MULTIPLIER || '1.2'),
-  SELL_STAGES:               JSON.parse(process.env.SELL_STAGES || '[{"multiplier":1.2,"percent":100}]'),
+  INSTANT_TP_MULTIPLIER:     parseFloat(process.env.INSTANT_TP_MULTIPLIER || '1.35'),
+  SELL_STAGES:               (() => {
+    try {
+      return JSON.parse(process.env.SELL_STAGES || '[{"multiplier":1.35,"percent":100}]');
+    } catch (e) {
+      console.error('ERROR: Invalid SELL_STAGES JSON in .env - using default');
+      return [{"multiplier":1.35,"percent":100}];
+    }
+  })(),
 
   // Safety filters
   MIN_LIQUIDITY_USD:         parseFloat(process.env.MIN_LIQUIDITY_USD || '100'),

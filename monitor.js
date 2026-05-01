@@ -1,43 +1,35 @@
 import { PublicKey }            from '@solana/web3.js';
 import WebSocket               from 'ws';
-import { getConnection, withRetry } from './wallet.js';
+import { getConnection }       from './wallet.js';
 import { log }                  from './logger.js';
 import { EventEmitter }         from 'events';
 import { CONFIG }               from './config.js';
 import { PoolService }          from './src/services/pool.js';
 import { dexService }           from './src/services/dexscreener-service.js';
 
-const RAYDIUM_CLMM   = 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK';
-const RAYDIUM_CPMM   = 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C';
-const RAYDIUM_AMM_V4 = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
 const SOL_MINT       = 'So11111111111111111111111111111111111111112';
 const USDC_MINT      = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const USDT_MINT      = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
 const QUOTE_MINTS    = new Set([SOL_MINT, USDC_MINT, USDT_MINT]);
 
-const DISC_CLMM_CREATE = Buffer.from([233, 146, 209, 142, 207, 104,  64, 188]);
-const DISC_CPMM_INIT   = Buffer.from([175, 175, 109,  31,  13, 152, 155, 237]);
-const AMM_V4_INIT2_BYTE = 1;
+// Pump.fun migration account (handles BOTH PumpSwap and Raydium migrations)
+const PUMP_MIGRATION_ACCOUNT = '39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg';
+const PUMPSWAP_PROGRAM_ID = 'PSwapMdSai8tjrEXcxFeQth87xC4rRsa4VA5mhGhXkP';
+const RAYDIUM_AMM_V4 = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
 
 export class PoolMonitor extends EventEmitter {
   constructor() {
     super();
-    this._subscriptionId = null;
     this._seen           = new Set();
-    this._rateLimitCount = 0;
     this._paused         = false;
-    this._feeSubIds      = [];
-    this._clmmSubId      = null;
-    this._cpmmSubId      = null;
     this._running        = false;
-    this._queue          = [];
-    this._processing    = false;
-    this._pollTimer     = null;
-    this._pollCounter   = 0;
-    this._pumpWs        = null;
-    this._pumpPingTimer = null;
-    this._pumpReconnect = 2000;
-    this._pumpLastCheck = {};
+    this._pollTimer      = null;
+    this._pollCounter    = 0;
+    this._pumpWs         = null;
+    this._pumpPingTimer  = null;
+    this._pumpReconnect  = 2000;
+    this._pumpLastCheck  = {};
+    this._lastPoolEmit   = null;
   }
 
   pause()      { this._paused = true;  log('info', 'Pool monitor paused'); }
@@ -48,15 +40,20 @@ export class PoolMonitor extends EventEmitter {
   async start() {
     this._running = true;
     log('info', '══════════════════════════════════════════════════');
-    log('info', '  POOL MONITOR v4 — PUMPPORTAL + HYBRID');
-    log('info', '  A: PumpPortal migration (instant)');
-    log('info', '  B: onLogs on CLMM/CPMM (backup)');
-    log('info', '  C: DexScreener polling (safety net)');
+    log('info', '  POOL MONITOR v8 — PUMP WS + ONLOGS + DEXSCREENER');
+    log('info', '  A: PumpPortal WS (migration + newToken)');
+    log('info', '  B: Migration account onLogs (PumpSwap + Raydium)');
+    log('info', '  C: DexScreener search (new pairs)');
     log('info', '══════════════════════════════════════════════════');
+    log('info', '[MON] Starting detection layers...');
 
+    // Layer 1: PumpPortal WebSocket (subscribeMigration + subscribeNewToken)
     this._startPumpLayer();
-    this._startCLMMLayer();
-    this._startCPMMLayer();
+
+    // Layer 2: Direct onLogs for pump.fun migration account (catches BOTH PumpSwap + Raydium)
+    this._startMigrationAccountLayer();
+    
+    // Layer 3: DexScreener search for new pairs (enrichment/backup)
     this._startPollLayer();
   }
 
@@ -65,18 +62,148 @@ export class PoolMonitor extends EventEmitter {
     clearInterval(this._pollTimer);
     clearInterval(this._pumpPingTimer);
     if (this._pumpWs) { try { this._pumpWs.close(); } catch {} }
-    const conn = getConnection();
-    for (const id of [this._clmmSubId, this._cpmmSubId, ...this._feeSubIds]) {
-      if (id) try { await conn.removeOnLogsListener(id); } catch {}
+    // Remove onLogs listener
+    if (this._migrationSubId) {
+      try {
+        const conn = getConnection();
+        await conn.removeOnLogsListener(this._migrationSubId);
+      } catch {}
     }
-    this._subscriptionId = null;
-    log('info', 'Pool monitor stopped');
+    log('info', '[MON] Pool monitor stopped');
+  }
+  
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MIGRATION ACCOUNT LAYER — Direct onLogs for pump.fun migrations
+  // Catches BOTH PumpSwap AND Raydium migrations (covers 100% of graduated tokens)
+  // ═══════════════════════════════════════════════════════════════════════════
+  _startMigrationAccountLayer() {
+    const conn = getConnection();
+    log('info', `[PUMP-MIG] Subscribing to migration account: ${PUMP_MIGRATION_ACCOUNT.slice(0,8)}...`);
+    
+    this._migrationSubId = conn.onLogs(
+      new PublicKey(PUMP_MIGRATION_ACCOUNT),
+      async ({ signature, err, logs }) => {
+        if (err) return;
+        if (this._seen.has('mig_' + signature)) return;
+        
+        // Quick check: only process if logs mention a migrate-like instruction
+        if (logs) {
+          const logStr = logs.join(' ');
+          if (!logStr.includes('migrate') && !logStr.includes('Migrate') && !logStr.includes('Initialize')) {
+            return;
+          }
+        }
+        
+        this._seen.add('mig_' + signature);
+        log('snipe', `[PUMP-MIG] Migration detected: ${signature.slice(0,10)}... — fetching full tx`);
+        
+        // Fetch full parsed transaction for reliable mint extraction
+        await this._processMigrationTransaction(signature);
+      },
+      'confirmed'
+    );
+    log('success', '[PUMP-MIG] Migration account listener active');
+  }
+  
+  /**
+   * Fetch full parsed transaction and extract token mint from postTokenBalances.
+   * Distinguishes PumpSwap vs Raydium by checking which program is invoked.
+   */
+  async _processMigrationTransaction(signature) {
+    const conn = getConnection();
+    
+    // Retry getParsedTransaction (may take a moment to be indexed)
+    let tx = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        tx = await conn.getParsedTransaction(signature, {
+          maxSupportedTransactionVersion: 0,
+          commitment: 'confirmed',
+        });
+        if (tx) break;
+      } catch (e) {
+        log('debug', `[PUMP-MIG] getParsedTransaction attempt ${attempt + 1} failed: ${e.message}`);
+      }
+      await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+    }
+    
+    if (!tx || !tx.meta) {
+      log('warn', `[PUMP-MIG] Could not fetch tx: ${signature.slice(0,10)}...`);
+      return;
+    }
+    
+    // Determine program: PumpSwap or Raydium
+    const accountKeys = tx.transaction?.message?.accountKeys || [];
+    const programIds = accountKeys.map(k => (typeof k === 'string' ? k : k.pubkey?.toString?.() || k.toString()));
+    
+    let program = 'unknown';
+    let poolId = null;
+    
+    if (programIds.includes(PUMPSWAP_PROGRAM_ID)) {
+      program = 'pumpswap';
+    } else if (programIds.includes(RAYDIUM_AMM_V4)) {
+      program = 'raydium_v4';
+    }
+    
+    // Extract token mint from postTokenBalances
+    // The non-SOL, non-USDC, non-USDT mint that appears is the new token
+    const postBalances = tx.meta.postTokenBalances || [];
+    let tokenMint = null;
+    
+    for (const bal of postBalances) {
+      const mint = bal.mint;
+      if (!mint) continue;
+      if (QUOTE_MINTS.has(mint)) continue;
+      tokenMint = mint;
+      break;
+    }
+    
+    // Also try preTokenBalances if post didn't have it
+    if (!tokenMint) {
+      const preBalances = tx.meta.preTokenBalances || [];
+      for (const bal of preBalances) {
+        const mint = bal.mint;
+        if (!mint) continue;
+        if (QUOTE_MINTS.has(mint)) continue;
+        tokenMint = mint;
+        break;
+      }
+    }
+    
+    if (!tokenMint) {
+      log('warn', `[PUMP-MIG] No token mint found in tx: ${signature.slice(0,10)}...`);
+      return;
+    }
+    
+    // Skip if already seen this token
+    if (this._seen.has(tokenMint)) return;
+    this._seen.add(tokenMint);
+    
+    // Try to find pool ID from inner instructions or DexScreener
+    const dexPool = await this._fetchDexScreenerPool(tokenMint);
+    poolId = dexPool?.poolId || `mig_${tokenMint.slice(0, 8)}`;
+    
+    log('snipe', `[PUMP-MIG] 🚀 ${program.toUpperCase()} migration: ${tokenMint.slice(0,8)}... (pool: ${poolId.slice(0,8)}...)`);
+    
+    const pool = {
+      signature,
+      poolId,
+      tokenMint,
+      quoteMint: SOL_MINT,
+      program,
+      liquidityUSD: dexPool?.liquidityUSD || 0,
+      timestamp: Date.now(),
+      source: 'migration_onlogs',
+    };
+    
+    this._onPool(pool, 'PUMP-MIG');
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
   // PUMPPORTAL LAYER — Real-time pump.fun → Raydium migration (instant signal)
   // ═══════════════════════════════════════════════════════════════════════════
   _startPumpLayer() {
+    log('info', '[MON] Starting PumpPortal WebSocket');
     const uri = 'wss://pumpportal.fun/api/data';
 
     const connect = () => {
@@ -86,12 +213,10 @@ export class PoolMonitor extends EventEmitter {
       this._pumpWs = new WebSocket(uri);
 
       this._pumpWs.on('open', () => {
-        log('success', '[PUMP] Connected — subscribing to migration events');
+        log('success', '[PUMP] ✅ Connected — subscribing to migration events');
+        log('info', '[PUMP] 📡 Subscribed to: subscribeMigration, subscribeNewToken');
         
-        // Subscribe to migration events (pump.fun → Raydium)
         this._pumpWs.send(JSON.stringify({ method: 'subscribeMigration' }));
-        
-        // Subscribe to new token creation (extra signal)
         this._pumpWs.send(JSON.stringify({ method: 'subscribeNewToken' }));
 
         this._pumpPingTimer = setInterval(() => {
@@ -117,7 +242,7 @@ export class PoolMonitor extends EventEmitter {
       this._pumpWs.on('close', () => {
         clearInterval(this._pumpPingTimer);
         if (!this._running) return;
-        log('warn', `[PUMP] Disconnected — reconnecting in ${this._pumpReconnect}ms`);
+        log('warn', `[PUMP] 🔌 Disconnected — reconnecting in ${this._pumpReconnect}ms`);
         setTimeout(connect, this._pumpReconnect);
         this._pumpReconnect = Math.min(this._pumpReconnect * 2, 30_000);
       });
@@ -158,9 +283,13 @@ export class PoolMonitor extends EventEmitter {
 
       if (!mint || !poolId) return;
       if (this._seen.has(mint)) return;
+      
+      // Skip if migration token is a quote mint (SOL, USDC, USDT)
+      if (QUOTE_MINTS.has(mint)) return;
+      
       this._seen.add(mint);
 
-      log('snipe', `[PUMP] Migration: ${mint.slice(0,10)}... → ${poolId.slice(0,10)}...`);
+      log('snipe', `[PUMP] 🚀 MIGRATION: ${mint.slice(0,8)}... → ${poolId.slice(0,8)}... (mc: $${(data.marketCap/1000).toFixed(1)}k)`);
 
       const pool = {
         signature: 'mig_' + mint,
@@ -187,9 +316,8 @@ export class PoolMonitor extends EventEmitter {
       if (this._seen.has('new_' + mint)) return;
       this._seen.add('new_' + mint);
 
-      log('info', `[PUMP] New token: ${mint.slice(0,10)}...`);
+      log('info', `[PUMP] ✨ NEW TOKEN: ${mint.slice(0,8)}... (checking for migration...)`);
       
-      // Check for migration immediately
       this._checkMigration(mint);
       return;
     }
@@ -208,240 +336,10 @@ export class PoolMonitor extends EventEmitter {
   }
 
   _calcPumpLiq(data) {
-    // Estimate liquidity from pump.fun migration data
-    // virtualSolReserves is in lamports, divide by 1e9 for SOL
     const solReserve = parseFloat(data.virtualSolReserves ?? 0) / 1e9;
     const price = parseFloat(data.marketCap ?? 0);
-    const liqUSD = solReserve * 150; // SOL price estimate
+    const liqUSD = solReserve * 150;
     return liqUSD;
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // CLMM LAYER — onLogs on CLMM program + discriminator check
-  // ═══════════════════════════════════════════════════════════════════════════
-  _startCLMMLayer() {
-    const conn = getConnection();
-    log('info', `[L1] Subscribing to CLMM program logs: ${RAYDIUM_CLMM.slice(0,8)}...`);
-    
-    this._clmmSubId = conn.onLogs(
-      new PublicKey(RAYDIUM_CLMM),
-      async ({ signature, err }) => {
-        if (err) return;
-        if (this._seen.has(signature)) return;
-        
-        try {
-          this._queue.push({ signature, program: 'CLMM', retries: 0 });
-          this._processQueue();
-        } catch (e) {
-          log('warn', `[L1-CLMM] Queue error: ${e.message}`);
-        }
-      },
-      'confirmed'
-    );
-    log('success', '[L1] CLMM program listener active');
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // CPMM LAYER — onLogs on CPMM program + discriminator check
-  // ═══════════════════════════════════════════════════════════════════════════
-  _startCPMMLayer() {
-    const conn = getConnection();
-    log('info', `[L2] Subscribing to CPMM program logs: ${RAYDIUM_CPMM.slice(0,8)}...`);
-    
-    this._cpmmSubId = conn.onLogs(
-      new PublicKey(RAYDIUM_CPMM),
-      async ({ signature, err }) => {
-        if (err) return;
-        if (this._seen.has(signature)) return;
-        
-        try {
-          this._queue.push({ signature, program: 'CPMM', retries: 0 });
-          this._processQueue();
-        } catch (e) {
-          log('warn', `[L2-CPMM] Queue error: ${e.message}`);
-        }
-      },
-      'confirmed'
-    );
-    log('success', '[L2] CPMM program listener active');
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // POLL LAYER — DexScreener as safety net every 30s
-  // ═══════════════════════════════════════════════════════════════════════════
-  _startPollLayer() {
-    const poll = async () => {
-      this._pollCounter++;
-      try {
-        // Use dexService (with 3-API routing and rate limiting)
-        const result = await dexService.getNewPairs('solana', 20);
-        if (!result.success || !result.data) {
-          return;
-        }
-        
-        for (const pair of result.data) {
-          if (pair.chainId !== 'solana') continue;
-          const mint = pair.baseToken?.address;
-          if (!mint || this._seen.has('ds_' + mint)) continue;
-          
-          // Only process recent pairs (within last 5 minutes)
-          const pairAge = Date.now() - (pair.pairCreatedAt || 0);
-          if (pairAge > 300000) continue;
-          
-          // Check liquidity - lower threshold to catch new tokens
-          const liquidity = pair.liquidity?.usd || 0;
-          if (liquidity < 50) continue;
-          
-          this._seen.add('ds_' + mint);
-          
-          const pool = {
-            signature: 'ds_' + mint,
-            poolId: pair.pairAddress,
-            tokenMint: mint,
-            baseMint: mint,
-            quoteMint: 'So11111111111111111111111111111111111111112',
-            vaultA: null,
-            vaultB: null,
-            program: 'dexscreener',
-            liquidityUSD: liquidity,
-            timestamp: Date.now(),
-            source: 'dexscreener',
-          };
-          
-          log('snipe', `[L3] DexScreener: ${mint.slice(0,10)}... liq:$${liquidity.toFixed(0)}`);
-          this._onPool(pool, 'L3');
-        }
-      } catch (e) {
-        log('warn', `[L3] Poll error: ${e.message}`);
-      }
-    };
-
-    poll();
-    this._pollTimer = setInterval(poll, 10_000); // Reduced to 10s for faster detection
-    log('success', '[L3] DexScreener polling active (10s interval)');
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // QUEUE PROCESSING — fetch tx, check discriminator, emit if valid pool
-  // ═══════════════════════════════════════════════════════════════════════════
-  async _processQueue() {
-    if (this._processing || this._paused) return;
-    if (this._queue.length === 0) return;
-    
-    this._processing = true;
-    while (this._queue.length > 0) {
-      const item = this._queue.shift();
-      if (this._seen.has(item.signature)) continue;
-      
-      try {
-        const pool = await withRetry(
-          () => this._parsePoolTx(item.signature, item.program),
-          3, 500
-        );
-        if (pool) {
-          this._seen.add(item.signature);
-          log('snipe', `[${item.program}] NEW POOL: ${pool.tokenMint.slice(0,10)}... | $${pool.liquidityUSD?.toLocaleString() ?? '?'}`);
-          this._onPool(pool, item.program);
-        }
-      } catch (e) {
-        if (e.message?.includes('429')) {
-          this._rateLimitCount++;
-          this._queue.unshift(item);
-          await new Promise(r => setTimeout(r, 2000));
-        } else {
-          log('warn', `[${item.program}] Parse failed: ${e.message}`);
-        }
-      }
-      
-      if (this._queue.length > 100) break;
-    }
-    this._processing = false;
-  }
-
-  async _parsePoolTx(signature, program) {
-    const conn = getConnection();
-    const tx   = await conn.getParsedTransaction(signature, {
-      maxSupportedTransactionVersion: 0,
-      commitment: 'confirmed',
-    });
-    if (!tx?.transaction?.message?.accountKeys) return null;
-
-    const meta     = tx.meta;
-    const accounts = tx.transaction.message.accountKeys.map(k =>
-      k.pubkey?.toString() ?? k.toString()
-    );
-
-    const ixList = tx.transaction.message.instructions || [];
-    
-    for (const ix of ixList) {
-      const prog = ix.programId?.toString() ?? accounts[ix.programIdIndex];
-      if (program === 'CLMM' && prog !== RAYDIUM_CLMM) continue;
-      if (program === 'CPMM' && prog !== RAYDIUM_CPMM) continue;
-
-      if (!ix.data) continue;
-      const data = Buffer.from(ix.data, 'base64');
-
-      if (program === 'CLMM') {
-        if (data.length >= 8 && data.subarray(0, 8).equals(DISC_CLMM_CREATE)) {
-          return this._buildCLMMPool(ix, accounts, meta, signature);
-        }
-      } else if (program === 'CPMM') {
-        if (data.length >= 8 && data.subarray(0, 8).equals(DISC_CPMM_INIT)) {
-          return this._buildCPMMPool(ix, accounts, meta, signature);
-        }
-      }
-    }
-    return null;
-  }
-
-  _buildCLMMPool(ix, accounts, meta, signature) {
-    const ixAccs = (ix.accounts || []).map(a => 
-      typeof a === 'string' ? a : accounts[a]
-    );
-    const g = i => ixAccs[i] ?? null;
-    
-    const poolId = g(2);
-    const mint0 = g(3);
-    const mint1 = g(4);
-    if (!poolId || !mint0 || !mint1) return null;
-
-    const pair = this._resolvePair(mint0, mint1);
-    if (!pair) return null;
-    const { tokenMint, quoteMint } = pair;
-
-    return {
-      signature, poolId, tokenMint, baseMint: mint0, quoteMint,
-      vaultA: g(5), vaultB: g(6),
-      program: 'CLMM',
-      liquidityUSD: this._estimateLiq(meta),
-      timestamp: (meta?.blockTime || 0) * 1000,
-      source: 'clmm_logs',
-    };
-  }
-
-  _buildCPMMPool(ix, accounts, meta, signature) {
-    const ixAccs = (ix.accounts || []).map(a =>
-      typeof a === 'string' ? a : accounts[a]
-    );
-    const g = i => ixAccs[i] ?? null;
-
-    const poolId = g(3);
-    const mint0 = g(4);
-    const mint1 = g(5);
-    if (!poolId || !mint0 || !mint1) return null;
-
-    const pair = this._resolvePair(mint0, mint1);
-    if (!pair) return null;
-    const { tokenMint, quoteMint } = pair;
-
-    return {
-      signature, poolId, tokenMint, baseMint: mint0, quoteMint,
-      vaultA: g(10), vaultB: g(11),
-      program: 'CPMM',
-      liquidityUSD: this._estimateLiq(meta),
-      timestamp: (meta?.blockTime || 0) * 1000,
-      source: 'cpmm_logs',
-    };
   }
 
   async _fetchDexScreenerPool(mint) {
@@ -469,44 +367,78 @@ export class PoolMonitor extends EventEmitter {
     } catch { return null; }
   }
 
-  _resolvePair(mint0, mint1) {
-    const QUOTE_MINTS = new Set([
-      'So11111111111111111111111111111111111111112',
-      'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
-      'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB'
-    ]);
-    const hasSOL = QUOTE_MINTS.has(mint0) || QUOTE_MINTS.has(mint1);
+  // ═══════════════════════════════════════════════════════════════════════════
+  // POLL LAYER — DexScreener search for truly new pairs (not profile feed)
+  // ═══════════════════════════════════════════════════════════════════════════
+  _startPollLayer() {
+    log('info', '[MON] Starting DexScreener search (5s interval) - using /latest/dex/search');
     
-    if (!hasSOL) {
-      log('warn', `Skipping non-SOL pair: ${mint0.slice(0,8)}/${mint1.slice(0,8)}`);
-      return null;
-    }
-    
-    if (QUOTE_MINTS.has(mint1) && !QUOTE_MINTS.has(mint0))
-      return { tokenMint: mint0, quoteMint: mint1 };
-    if (QUOTE_MINTS.has(mint0) && !QUOTE_MINTS.has(mint1))
-      return { tokenMint: mint1, quoteMint: mint0 };
-    return { tokenMint: mint0, quoteMint: mint1 };
+    const poll = async () => {
+      this._pollCounter++;
+      try {
+        // Use getTrendingPairs which uses /latest/dex/search (not profile feed)
+        const result = await dexService.getTrendingPairs('solana', 30);
+        if (!result.success || !result.data) {
+          return;
+        }
+        
+        for (const pair of result.data) {
+          const mint = pair.baseToken?.address;
+          if (!mint || this._seen.has('ds_' + mint)) continue;
+          
+          // Skip if base token is a quote mint (SOL, USDC, USDT)
+          if (QUOTE_MINTS.has(mint)) continue;
+          
+          const pairAge = Date.now() - (pair.pairCreatedAt || 0);
+          // No age limit - show all tokens from search
+          // (pairAge > 86400000) continue; // Disabled age filter for search endpoint
+          
+          // Handle undefined liquidity - allow pumpfun tokens if they're recent
+          const liquidity = pair.liquidity?.usd || 0;
+          const isPumpFun = pair.dexId === 'pumpfun';
+          const isRecent = pairAge < 1800000; // < 30 min
+          const minLiq = CONFIG.MIN_LIQUIDITY_USD || 100;
+          const maxLiq = CONFIG.MAX_LIQUIDITY_USD || 500000;
+          
+          // Filter by liquidity range from config ($100 – $500K per flowchart)
+          if (liquidity > maxLiq) continue; // Skip mega-cap tokens
+          if (liquidity < minLiq && !(isPumpFun && isRecent)) continue;
+          
+          this._seen.add('ds_' + mint);
+          
+          const pool = {
+            signature: 'ds_' + mint,
+            poolId: pair.pairAddress,
+            tokenMint: mint,
+            baseMint: mint,
+            quoteMint: pair.quoteToken?.address || SOL_MINT,
+            vaultA: null,
+            vaultB: null,
+            program: pair.dexId || 'dexscreener',
+            liquidityUSD: liquidity,
+            timestamp: Date.now(),
+            source: 'dexscreener',
+          };
+          
+          log('snipe', `[L3] 📊 New pair: ${mint.slice(0,8)}... liq:$${liquidity.toFixed(0)} dex:${pair.dexId}`);
+          this._onPool(pool, 'L3');
+        }
+      } catch (e) {
+        log('warn', `[L3] Poll error: ${e.message}`);
+      }
+    };
+
+    poll();
+    this._pollTimer = setInterval(poll, 5_000);
+    log('success', '[MON] DexScreener polling active (5s interval)');
   }
 
-  _estimateLiq(meta) {
-    if (!meta?.postBalances || !meta?.preBalances) return 0;
-    const solAdded = meta.postBalances.reduce((sum, bal, i) =>
-      sum + Math.max(0, bal - (meta.preBalances[i] ?? 0)), 0
-    ) / 1e9;
-    return solAdded * 150;
-  }
-
-  async _onPool(pool, layer) {
+  _onPool(pool, layer) {
     if (!pool?.tokenMint) return;
     if (this._paused) return;
 
-    try {
-      if (!pool.liquidityUSD && pool.poolId) {
-        pool.liquidityUSD = await PoolService.getLiquidityUSD(pool.tokenMint, pool.poolId);
-      }
-    } catch {}
-
+    log('info', `[MON] [${layer}] Pool detected: ${pool.tokenMint.slice(0,8)}... (liquidity: $${pool.liquidityUSD?.toFixed(0) || '?'})`);
+    
     this.emit('newPool', pool);
   }
 }

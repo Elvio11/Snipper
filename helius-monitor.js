@@ -125,14 +125,22 @@ export class HeliusMonitor extends EventEmitter {
     if (this._seen.has(sig)) return;
 
     const logs = result.transaction?.meta?.logMessages || [];
-    const logStr = logs.join(' ');
-
-    if (logStr.includes('SwapEvent') || logStr.includes('Dex::') || logStr.includes('swap')) return;
-    if (!logStr.includes('Instruction:')) return;
-
-    const hasCreatePool = logStr.includes('CreatePool') || logStr.includes('create_pool') || 
-                          logStr.includes('Create') || logStr.includes('initialize');
-    if (!hasCreatePool) return;
+    
+    // Check for new pool creation via program IDs - more reliable than log string parsing
+    const instructions = result.transaction?.message?.instructions || [];
+    const programIds = new Set();
+    
+    for (const ix of instructions) {
+      if (ix.programId) {
+        programIds.add(ix.programId.toString());
+      }
+    }
+    
+    // Raydium CLMM or AMM program IDs indicate new pool creation
+    const isNewPool = programIds.has(RAYDIUM_CLMM.toString()) || 
+                      programIds.has(RAYDIUM_AMM_V4.toString());
+    
+    if (!isNewPool) return;
 
     this._seen.add(sig);
     log('snipe', `Pool create candidate: ${sig}`);

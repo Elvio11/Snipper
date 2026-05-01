@@ -6,7 +6,7 @@ import {
   RAYDIUM_AMM_PROGRAM, 
   parseCLMMPoolAccount 
 } from '../src/services/raydium.js';
-import { getDexScreenerToken, extractLiquidityFromDexScreener } from '../src/services/dexscreener.js';
+import { dexService } from '../src/services/dexscreener-service.js';
 import { EventEmitter } from 'events';
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
@@ -116,14 +116,15 @@ export class CLMMPoolMonitor extends EventEmitter {
     const tokenMint = poolData.mintA === SOL_MINT ? poolData.mintB : poolData.mintA;
 
     // Get real liquidity from DexScreener
-    let dexData = null;
+    let liquidityUSD = 0;
     try {
-      dexData = await getDexScreenerToken(tokenMint);
+      const result = await dexService.getTokenPairs(tokenMint);
+      if (result.success && result.data?.length) {
+        liquidityUSD = result.data[0].liquidity?.usd || 0;
+      }
     } catch {}
 
-    const liquidity = extractLiquidityFromDexScreener(dexData);
-
-    log('info', `Pool parsed: ${tokenMint.slice(0,8)}... ($${liquidity.liquidityUSD.toLocaleString()})`);
+    log('info', `Pool parsed: ${tokenMint.slice(0,8)}... ($${liquidityUSD.toLocaleString()})`);
 
     return {
       signature,
@@ -134,9 +135,9 @@ export class CLMMPoolMonitor extends EventEmitter {
       vaultA: poolData.vaultA,
       vaultB: poolData.vaultB,
       program: 'CLMM',
-      liquidityUSD: liquidity.liquidityUSD,
-      liquiditySOL: liquidity.liquiditySOL,
-      priceNative: liquidity.priceNative,
+      liquidityUSD: liquidityUSD,
+      liquiditySOL: 0,
+      priceNative: 0,
       timestamp: (tx.blockTime || 0) * 1000,
     };
   }
