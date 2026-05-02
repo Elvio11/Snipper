@@ -150,7 +150,7 @@ export async function analyzeToken(mintAddress) {
         reasons.push(`⚠ Simulation inconclusive but DexScreener shows $${dexData.liquidityUSD.toLocaleString()} liquidity - allowing`);
       } else {
         // No DexScreener data + failed simulation = block
-        reasons.push(`✖ Simulation failed and not on DexScreener - blocking as precaution`);
+        reasons.push(`✖ Simulation failed: ${simulation.reason || 'unknown'} - blocking to save fees`);
         return { safe: false, reasons, score: 0 };
       }
     } else {
@@ -160,8 +160,9 @@ export async function analyzeToken(mintAddress) {
     // Additional RugCheck validation (optional backup)
     const rugcheck = await checkRugCheck(mintAddress);
     if (rugcheck) {
-      if (rugcheck.score > 50) {
-        reasons.push(`✖ RugCheck high risk: score=${rugcheck.score}`);
+      const minScore = CONFIG.RUGCHECK_MIN_SCORE || 500;
+      if (rugcheck.score > minScore) {
+        reasons.push(`✖ RugCheck high risk: score=${rugcheck.score} (threshold: ${minScore})`);
         score -= 50;
       } else if (rugcheck.risks.length > 0) {
         reasons.push(`⚠ RugCheck risks: ${rugcheck.risks.slice(0, 3).join(', ')}`);

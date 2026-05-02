@@ -1,4 +1,4 @@
-import { sellToken, calculateDynamicSlippage } from './executor.js';
+import { sellToken, calculateDynamicSlippage, reclaimRent } from './executor.js';
 import { CONFIG } from './config.js';
 import { log } from './logger.js';
 import { sendAlert } from './telegram.js';
@@ -320,6 +320,11 @@ export class PositionManager {
     pos.pnlPercent = ((pos.pnlSOL || 0) / pos.solSpentOriginal) * 100;
     this._save();
     this._logTrade(pos);
+    
+    // RECLAIM RENT: Close token account to get ~0.002 SOL back
+    if (pos.status === 'closed' && !CONFIG.PAPER_TRADING) {
+      reclaimRent(mintAddress).catch(e => {}); // Fire and forget
+    }
   }
 
   async retryFailedCloses() {

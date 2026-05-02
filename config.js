@@ -23,6 +23,10 @@ export const CONFIG = {
   STOP_LOSS_PERCENT:         parseFloat(process.env.STOP_LOSS_PERCENT || '15'),
   SLIPPAGE_PERCENT:          parseFloat(process.env.SLIPPAGE_PERCENT || '10'),
   MAX_POSITIONS:             parseInt(process.env.MAX_POSITIONS || '3'),
+  USE_MANAGED_LANDING:       process.env.USE_MANAGED_LANDING !== 'false',
+  MAX_PRIORITY_FEE_SOL:      parseFloat(process.env.MAX_PRIORITY_FEE_SOL || '0.0001'),
+  RETRY_ON_FAILURE:          process.env.RETRY_ON_FAILURE !== 'false',
+  STRICT_DEDUPLICATION:      process.env.STRICT_DEDUPLICATION !== 'false',
 
   // Sell strategy
   SELL_MODE:                process.env.SELL_MODE || 'instant',  // 'instant' (100% at TP) or 'staged' (keep 50/50)
@@ -90,6 +94,7 @@ export const CONFIG = {
   SCANNER_MIN_TXNS: parseInt(process.env.SCANNER_MIN_TXNS || '0'),
   SCANNER_MAX_CANDIDATES: parseInt(process.env.SCANNER_MAX_CANDIDATES || '3'),
   SCANNER_SCORE_THRESHOLD: parseFloat(process.env.SCANNER_SCORE_THRESHOLD || '50'),
+  RUGCHECK_MIN_SCORE:        parseInt(process.env.RUGCHECK_MIN_SCORE || '500'),
 };
 
 export function validateConfig() {

@@ -1,152 +1,97 @@
+# ============================================================
+# SniperBOT — .gitignore
+# ============================================================
 
-node_modules
-
-# System files
-.DS_Store
-Thumbs.db
-ehthumbs.db
-Desktop.ini
-
-# Linux/Ubuntu system files
-*~
-*.swp
-*.swo
-.fuse_hidden*
-.directory
-.Trash-*
-.nfs*
-.gvfs-fuse-daemon-*
-
-# IDE and editors
-.idea/
-*.sublime-*
-.history/
-.windsurfrules
-*.code-workspace
-.vscode/sessions.json
-
-# Temporary files
-.temp/
-temp/
-tmp/
-*.tmp
-*.temp
-*.log
-*.cache
-.cache/
-
-# Environment files
+# ---- Environment & Secrets ----
 .env
 .env.local
-.env*.local
 .env.development
-venv/
-.venv/
-.env.example.development
-.env.example
 .env.desktop
-.env*
 .env.sentry-build-plugin
+# Keep .env.example and .env.production.example for onboarding
+!.env.example
+!.env.production.example
 
-# Dependencies
+# ---- Dependencies ----
 node_modules/
-*.lock
 package-lock.json
+bun.lock
 bun.lockb
 .pnpm-store/
 /.pnp
 .pnp.js
 
-# Build outputs
+# ---- Build Outputs ----
 dist/
 es/
 /lib/
 .next/
 /out/
-/build
-logs/
-test-output/
+/build/
 *.tsbuildinfo
 next-env.d.ts
 
-# Framework specific
-# Umi
-.umi/
-.umi-production/
-.umi-test/
-.dumi/tmp*/
+# ---- Logs & Runtime Data ----
+logs/
+*.log
+trade-history.jsonl
+trade-history.jsonl.bak
 
-# Vercel
-.vercel/
+# ---- Debug & Scratch Files ----
+scratch/
+debug_*.ts
+verify_price_temp.js
+bot_output*.txt
+bot_test*.txt
 
-# Testing and CI
+# ---- Testing Artifacts ----
+test-output/
 coverage/
 .coverage/
 .nyc_output/
-.eslintcache
-.stylelintcache
+test-results/
+playwright-report/
+.playwright/
+Trade_Testing_Results_*/
 
-# Database
-/prisma/db.sqlite
-/prisma/db.sqlite-journal
-db.sqlite
+# ---- Dev Tooling ----
+graphify-out/
+pr-body.md
+journal.md
+AGENTS.md
+DEVELOPMENT_GUIDE.md
 
-# Debug
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-.pnpm-debug.log*
+# ---- System Files ----
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+*~
+*.swp
+*.swo
+._*
+.Spotlight-V100
+.Trashes
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
 
-# Misc
-*.pem
-src/tools/binance-spot/a.sh
-a.sh
-src/tools/binance-spot/a.txt
+# ---- IDE & Editors ----
+.idea/
+.vscode/
+*.sublime-*
+*.sublime-workspace
+*.code-workspace
+.history/
+.windsurfrules
+.project
+.classpath
+.c9/
+*.launch
+.settings/
 
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-.pytest_cache/
-.mypy_cache/
-*.egg-info/
-.eggs/
-*.egg
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Rust
-target/
-**/*.rs.bk
-Cargo.lock
-
-# Service Worker / Serwist
-public/sw*
-public/swe-worker*
-
-# Generated files
-public/*.js
-public/sitemap.xml
-public/sitemap-index.xml
-sitemap*.xml
-robots.txt
-
-# Git hooks
-.husky/prepare-commit-msg
-
-# Documents and media
-*.patch
-*.pdf
-*.ppt*
-*.doc*
-*.xls*
-
-# Cloud service keys
-vertex-ai-key.json
-
-# AI coding tools
+# ---- AI Coding Tools ----
 .local/
 .claude/
 .mcp.json
@@ -160,57 +105,38 @@ CLAUDE.local.md
 .copilot/
 copilot-chat/
 .github/copilot/
-
-# Misc
-./packages/lobe-ui
-prd
 GEMINI.md
-e2e/reports
 .agent-prompts/
 
-# IDE workspace files
-*.code-workspace
-.project
-.classpath
-.c9/
-*.launch
-.settings/
-*.sublime-workspace
+# ---- Database ----
+/prisma/db.sqlite
+/prisma/db.sqlite-journal
+db.sqlite
 
-# OS generated files
-._*
-.Spotlight-V100
-.Trashes
+# ---- Debug Logs ----
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
 
-# Turbo
+# ---- Security ----
+*.pem
+vertex-ai-key.json
+
+# ---- Misc ----
+*.cache
+.cache/
+.temp/
+temp/
+tmp/
+*.tmp
+*.temp
+.eslintcache
+.stylelintcache
 .turbo/
-
-# Foundry/Forge
-cache/
-out/
-broadcast/
-
-# Test artifacts
-test-results/
-playwright-report/
-.playwright/
-
-# Storybook
 storybook-static/
-
-# TypeDoc
 typedoc-output/
 api-docs/
-
-# Jupyter
 .ipynb_checkpoints/
-*.ipynb_checkpoints
-
-# Docker
 *.pid
-*.seed
 *.pid.lock
-
-# Nested git repositories (separate projects)
-x402-deploy/
-

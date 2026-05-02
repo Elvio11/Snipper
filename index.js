@@ -31,6 +31,8 @@ process.on('unhandledRejection', (reason, promise) => {
 let isShuttingDown = false;
 let monitor = null;
 let positions = null;
+let lastRefillTime = 0;
+const REFILL_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
 
 async function gracefulShutdown(signal) {
   if (isShuttingDown) return;
@@ -119,6 +121,7 @@ async function main() {
   const MAX_QUEUE_SIZE = 4;
   let tokenQueue = [];         // Discovered tokens waiting for analysis
   let permanentlyBlocked = new Set(); // Honeypots - never analyze again
+  let attemptedTokens = new Set();    // Tokens already tried/bought in this session
   let isProcessingQueue = false;
 
   function resetBuying() {
@@ -133,10 +136,10 @@ async function main() {
   function addToQueue(poolInfo) {
     const { tokenMint, poolId, liquidityUSD } = poolInfo;
     
-    // Skip if already in queue or permanently blocked
-    if (permanentlyBlocked.has(tokenMint)) {
-      return false;
-    }
+    // Skip if already in queue, attempted, or permanently blocked
+    if (permanentlyBlocked.has(tokenMint)) return false;
+    if (CONFIG.STRICT_DEDUPLICATION && attemptedTokens.has(tokenMint)) return false;
+    
     if (tokenQueue.find(t => t.tokenMint === tokenMint)) {
       return false;
     }
@@ -209,9 +212,13 @@ async function main() {
       
       try {
         // Vault → Signer: refill signer before buy (per flowchart)
-        const refillResult = await refillSignerFromVault();
-        if (refillResult.success && refillResult.reason !== 'sufficient_balance') {
-          log('info', `[QUEUE] Vault → Signer refill completed`);
+        let refillResult = { success: true, reason: 'cooldown' };
+        if (Date.now() - lastRefillTime > REFILL_COOLDOWN_MS) {
+          refillResult = await refillSignerFromVault();
+          if (refillResult.success && refillResult.reason !== 'sufficient_balance') {
+            log('info', `[QUEUE] Vault → Signer refill completed`);
+            lastRefillTime = Date.now();
+          }
         }
         
         log('info', `[QUEUE] 🎯 Executing buy: ${buyAmount.toFixed(6)} SOL`);
@@ -222,6 +229,7 @@ async function main() {
           log('info', `[QUEUE] Using dynamic slippage based on $${Math.round(liquidityUSD)} liquidity: ${slippageBps/100}%`);
         }
         
+        attemptedTokens.add(tokenMint); // Mark as attempted immediately
         const result = await buyToken(tokenMint, buyAmount, poolId, slippageBps);
         
         if (!result.success) {
@@ -247,13 +255,12 @@ async function main() {
           pricePerToken: result.pricePerToken,
         });
         
-        // Clear queue after successful buy
-        tokenQueue = [];
-        log('info', `[QUEUE] 🧹 Queue cleared after successful buy`);
-        
         // Reset buying IMMEDIATELY on success (prevents false timeout warning)
         isSwapping = false;
         resetBuying();
+        
+        // Brief pause between trades to avoid rate limits
+        await new Promise(r => setTimeout(r, 1000));
         
       } catch (err) {
         log('error', `[QUEUE] Buy error: ${err.message}`);
@@ -418,6 +425,11 @@ async function main() {
   }, 60_000); // every minute
 
   // ─── Check existing positions on startup ─────────────────────────────────
+  const allExisting = [...positions.positions.entries()];
+  for (const [mint] of allExisting) {
+    attemptedTokens.add(mint);
+  }
+  
   const openPositions = positions.getOpenPositions();
   if (openPositions.length > 0) {
     log('info', `══════════════════════════════════════════════════`);

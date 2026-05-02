@@ -18,7 +18,7 @@ let _paperVaultBalance = 0.044;
 const RPC_URLS = [
   CONFIG.RPC_URL,
   CONFIG.RPC_URL_FALLBACK,
-].filter(url => url && url !== 'https://api.mainnet-beta.solana.com');
+].filter(url => !!url);
 
 function getCurrentRPC() {
   if (RPC_URLS.length === 0) return CONFIG.RPC_URL;
@@ -139,16 +139,34 @@ export function getWallet() {
 
 export async function getSOLBalance() {
   if (CONFIG.PAPER_TRADING) return _paperSignerBalance;
-  const conn = getConnection();
-  const bal = await conn.getBalance(getSignerWallet().publicKey);
-  return bal / LAMPORTS_PER_SOL;
+  try {
+    const conn = getConnection();
+    const bal = await conn.getBalance(getSignerWallet().publicKey);
+    return bal / LAMPORTS_PER_SOL;
+  } catch (err) {
+    if (err.message.includes('401') || err.message.includes('Unauthorized')) {
+      log('warn', 'Primary RPC key invalid/expired. Switching...');
+      switchRPC();
+      return getSOLBalance(); // Retry once
+    }
+    throw err;
+  }
 }
 
 export async function getVaultBalance() {
   if (CONFIG.PAPER_TRADING) return _paperVaultBalance;
-  const conn = getConnection();
-  const bal = await conn.getBalance(getVaultWallet().publicKey);
-  return bal / LAMPORTS_PER_SOL;
+  try {
+    const conn = getConnection();
+    const bal = await conn.getBalance(getVaultWallet().publicKey);
+    return bal / LAMPORTS_PER_SOL;
+  } catch (err) {
+    if (err.message.includes('401') || err.message.includes('Unauthorized')) {
+      log('warn', 'Primary RPC key invalid/expired. Switching...');
+      switchRPC();
+      return getVaultBalance(); // Retry once
+    }
+    throw err;
+  }
 }
 
 // Paper trading balance adjustments
@@ -184,15 +202,17 @@ export async function refillSignerFromVault() {
 
   const signerBal = await getSOLBalance();
   const vaultBal = await getVaultBalance();
-  const minSignerBal = CONFIG.SIGNER_MIN_BALANCE || 0.15;
-  const refillAmount = CONFIG.SIGNER_REFILL_AMOUNT || 0.1;
+  const minSignerBal = CONFIG.SIGNER_MIN_BALANCE || 0.015;
+  const refillAmount = CONFIG.SIGNER_REFILL_AMOUNT || 0.015;
+
+  log('debug', `Refill check: signer=${signerBal.toFixed(6)}, vault=${vaultBal.toFixed(6)}, minSigner=${minSignerBal.toFixed(6)}, refill=${refillAmount.toFixed(6)}, combined=${(minSignerBal + refillAmount).toFixed(6)}`);
 
   if (signerBal >= minSignerBal) {
     return { success: true, reason: 'sufficient_balance' };
   }
 
   if (vaultBal <= minSignerBal + refillAmount) {
-    const msg = 'Vault balance too low for refill';
+    const msg = `Vault balance too low for refill: ${vaultBal.toFixed(6)} <= ${(minSignerBal + refillAmount).toFixed(6)}`;
     log('warn', msg);
     return { success: false, reason: 'vault_low' };
   }

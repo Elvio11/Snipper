@@ -1,4 +1,5 @@
-import { VersionedTransaction, LAMPORTS_PER_SOL, PublicKey, Transaction, SystemProgram, sendAndConfirmTransaction } from '@solana/web3.js';
+import { VersionedTransaction, LAMPORTS_PER_SOL, PublicKey, Transaction, SystemProgram, sendAndConfirmTransaction, ComputeBudgetProgram } from '@solana/web3.js';
+import { getAssociatedTokenAddress, createCloseAccountInstruction } from '@solana/spl-token';
 import { getConnection, getWallet, getVaultWallet, getSOLBalance as getBalance, paperDeductSigner, paperCreditSigner, paperTransferToVault } from './wallet.js';
 import { CONFIG } from './config.js';
 import { log } from './logger.js';
@@ -23,18 +24,39 @@ async function jupiterV2Order(inputMint, outputMint, amount, taker, slippageBps 
     amount: String(amount),
     taker,
   });
-  // Only pass slippageBps if explicitly set; otherwise Jupiter uses RTSE (automatic)
-  if (slippageBps !== null) {
+  if (CONFIG.MAX_PRIORITY_FEE_SOL > 0) {
+    // Hard cap at 0.0001 SOL even if config says higher, to prevent drain spikes
+    const cap = Math.min(CONFIG.MAX_PRIORITY_FEE_SOL, 0.0001);
+    // Estimate 200k compute units for a typical swap
+    const microLamports = Math.floor((cap * 1e9 / 200000) * 1e6);
+    params.set('computeUnitPriceMicroLamports', String(microLamports));
+  }
+  // Only pass slippageBps if explicitly set and > 0; otherwise Jupiter uses RTSE (automatic)
+  if (slippageBps !== null && slippageBps > 0) {
     params.set('slippageBps', String(slippageBps));
   }
 
   const headers = { 'Accept': 'application/json' };
   if (CONFIG.JUPITER_API_KEY) headers['x-api-key'] = CONFIG.JUPITER_API_KEY;
 
-  const res = await fetch(`${SWAP_V2_BASE}/order?${params}`, {
-    headers,
-    signal: AbortSignal.timeout(10000),
-  });
+  let res;
+  try {
+    res = await fetch(`${SWAP_V2_BASE}/order?${params}`, {
+      headers,
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (res.status === 429) {
+      log('warn', `[JUP] Rate limited (429) on /order - waiting 1s and retrying...`);
+      await new Promise(r => setTimeout(r, 1000));
+      res = await fetch(`${SWAP_V2_BASE}/order?${params}`, {
+        headers,
+        signal: AbortSignal.timeout(10000),
+      });
+    }
+  } catch (e) {
+    throw new Error(`/order fetch error: ${e.message}`);
+  }
 
   if (!res.ok) {
     const body = await res.text().catch(() => '');
@@ -93,13 +115,117 @@ export async function buyToken(mintAddress, solAmount = CONFIG.BUY_AMOUNT_SOL, p
   const conn = getConnection();
   let lastError;
 
-  for (let attempt = 0; attempt <= retries; attempt++) {
+  const maxRetries = CONFIG.RETRY_ON_FAILURE ? retries : 0;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       const lamports = Math.floor(solAmount * LAMPORTS_PER_SOL);
       const finalSlippageBps = slippageBps || (CONFIG.SLIPPAGE_PERCENT * 100);
 
-      // ── Jupiter Swap V2: /order (all routers compete for best price) ──
-      log('info', `[V2] Requesting order: ${solAmount} SOL → ${mintAddress.slice(0,8)}... (slippage: ${finalSlippageBps/100}%)`);
+      // ── PRIMARY: Jupiter V1 quote+swap for speed and micro-amounts ──
+      log('info', `[V1-BUY] Requesting buy order: ${solAmount.toFixed(4)} SOL → ${mintAddress.slice(0,8)}... (slippage: ${finalSlippageBps/100}%)`);
+      
+      try {
+        // Step 1: Get Quote
+        const quoteParams = new URLSearchParams({
+          inputMint: SOL_MINT,
+          outputMint: mintAddress,
+          amount: String(lamports),
+          slippageBps: String(finalSlippageBps),
+          onlyDirectRoutes: 'false',
+          asLegacyTransaction: 'false',
+        });
+
+        const quoteRes = await fetch(`https://api.jup.ag/swap/v1/quote?${quoteParams}`, {
+          signal: AbortSignal.timeout(10000),
+        });
+        
+        if (!quoteRes.ok) throw new Error(`V1 quote failed: ${quoteRes.status}`);
+        const quoteData = await quoteRes.json();
+        
+        if (!quoteData.outAmount) throw new Error('V1: No quote available');
+        const tokenAmount = Number(quoteData.outAmount);
+
+        // Fetch decimals for price calculation
+        let decimals = 6;
+        try {
+          const mintInfo = await conn.getParsedAccountInfo(new PublicKey(mintAddress));
+          if (mintInfo.value?.data?.parsed?.info?.decimals !== undefined) {
+            decimals = mintInfo.value.data.parsed.info.decimals;
+          }
+        } catch (e) {
+          log('debug', `Failed to fetch decimals: ${e.message}`);
+        }
+        const pricePerToken = solAmount / (tokenAmount / Math.pow(10, decimals));
+        log('info', `[V1-BUY] Quote: ${(tokenAmount / Math.pow(10, decimals)).toFixed(2)} tokens at price ${pricePerToken.toFixed(10)} SOL`);
+
+        // Step 2: Get Swap Transaction
+        const swapRes = await fetch('https://api.jup.ag/swap/v1/swap', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            quoteResponse: quoteData,
+            userPublicKey: wallet.publicKey.toString(),
+            wrapAndUnwrapSol: true,
+            dynamicComputeUnitLimit: true,
+            prioritizationFeeLamports: 'auto',
+          }),
+          signal: AbortSignal.timeout(15000),
+        });
+        
+        if (!swapRes.ok) throw new Error(`V1 swap failed: ${swapRes.status}`);
+        const swapData = await swapRes.json();
+        
+        if (!swapData.swapTransaction) throw new Error('V1: No swap transaction returned');
+
+        // Step 3: Sign and Send
+        const tx = VersionedTransaction.deserialize(Buffer.from(swapData.swapTransaction, 'base64'));
+        tx.sign([wallet]);
+        const signedTxRaw = tx.serialize();
+
+        let txid;
+        log('info', `[V1-BUY] Executing buy via manual broadcast...`);
+        txid = await conn.sendRawTransaction(signedTxRaw, { skipPreflight: true, maxRetries: 2 });
+        await conn.confirmTransaction(txid, 'confirmed');
+
+        log('success', `BUY confirmed [V1]: ${solAmount.toFixed(6)} SOL → ${(tokenAmount/Math.pow(10, decimals)).toFixed(2)} tokens (tx: ${txid.slice(0,8)}...)`);
+        logTrade({
+          type: 'buy', mint: mintAddress,
+          solAmount, tokenAmount,
+          pricePerToken, txid,
+        });
+
+        // Transfer Back to Vault (optional cleanup)
+        const keepForGas = 0.006;
+        const currentBal = await conn.getBalance(wallet.publicKey);
+        const currentSOL = currentBal / LAMPORTS_PER_SOL;
+        const transferBack = currentSOL - keepForGas;
+
+        if (transferBack > 0.001) {
+          try {
+            const vaultWallet = getVaultWallet();
+            const transferTx = new Transaction().add(
+              SystemProgram.transfer({
+                fromPubkey: wallet.publicKey,
+                toPubkey: vaultWallet.publicKey,
+                lamports: Math.floor(transferBack * LAMPORTS_PER_SOL),
+              })
+            );
+            await sendAndConfirmTransaction(conn, transferTx, [wallet]);
+            log('info', `Signer → Vault: ${transferBack.toFixed(4)} SOL (kept ${keepForGas} for gas)`);
+          } catch (te) {
+            log('warn', `Signer → Vault transfer failed: ${te.message}`);
+          }
+        }
+
+        return { success: true, txid, tokenAmount, pricePerToken, solSpent: solAmount };
+
+      } catch (v1Err) {
+        log('warn', `V1-BUY failed: ${v1Err.message}, falling back to V2...`);
+      }
+
+      // ── FALLBACK: Jupiter Swap V2: /order ──
+      log('info', `[V2-BUY] Requesting fallback order: ${solAmount} SOL → ${mintAddress.slice(0,8)}...`);
       const order = await jupiterV2Order(
         SOL_MINT, mintAddress, lamports,
         wallet.publicKey.toString(), finalSlippageBps
@@ -107,76 +233,46 @@ export async function buyToken(mintAddress, solAmount = CONFIG.BUY_AMOUNT_SOL, p
 
       const tokenAmount = Number(order.outAmount);
       
-      // Fetch decimals to calculate accurate entry price
+      // Fetch decimals
       let decimals = 6;
       try {
         const mintInfo = await conn.getParsedAccountInfo(new PublicKey(mintAddress));
         if (mintInfo.value?.data?.parsed?.info?.decimals !== undefined) {
           decimals = mintInfo.value.data.parsed.info.decimals;
         }
-      } catch (e) {
-        log('debug', `Failed to fetch decimals for ${mintAddress}: ${e.message}`);
-      }
+      } catch (e) {}
       
       const pricePerToken = solAmount / (tokenAmount / Math.pow(10, decimals));
-      log('info', `[V2] Order received: router=${order.router} mode=${order.mode} out=${tokenAmount} feeBps=${order.feeBps}`);
+      log('info', `[V2-BUY] Order received: out=${tokenAmount}`);
 
-      // ── Sign the transaction ──
       const tx = VersionedTransaction.deserialize(Buffer.from(order.transaction, 'base64'));
       tx.sign([wallet]);
-      const signedTxBase64 = Buffer.from(tx.serialize()).toString('base64');
+      const signedTxRaw = tx.serialize();
 
-      // ── Execute via Jupiter (managed landing, MEV protection) ──
-      log('info', `[V2] Executing via Jupiter (managed landing)...`);
-      const result = await jupiterV2Execute(signedTxBase64, order.requestId);
-
-      if (result.status !== 'Success') {
-        throw new Error(`Jupiter /execute failed: code=${result.code} ${result.error || ''}`);
+      let txid;
+      if (CONFIG.USE_MANAGED_LANDING) {
+        const result = await jupiterV2Execute(Buffer.from(signedTxRaw).toString('base64'), order.requestId);
+        if (result.status !== 'Success') throw new Error(`V2 execute failed: ${result.code}`);
+        txid = result.signature;
+      } else {
+        txid = await conn.sendRawTransaction(signedTxRaw, { skipPreflight: true, maxRetries: 2 });
+        await conn.confirmTransaction(txid, 'confirmed');
       }
 
-      const txid = result.signature;
-      const actualTokens = Number(result.outputAmountResult) || tokenAmount;
-      const actualSOL = Number(result.inputAmountResult) / LAMPORTS_PER_SOL || solAmount;
-
-      log('success', `BUY confirmed [V2]: ${actualSOL.toFixed(6)} SOL → ${(actualTokens/1e6).toFixed(2)} tokens (tx: ${txid.slice(0,8)}...)`);
+      log('success', `BUY confirmed [V2]: ${solAmount.toFixed(6)} SOL → ${(tokenAmount/Math.pow(10, decimals)).toFixed(2)} tokens (tx: ${txid.slice(0,8)}...)`);
       logTrade({
         type: 'buy', mint: mintAddress,
-        solAmount: actualSOL, tokenAmount: actualTokens,
+        solAmount, tokenAmount,
         pricePerToken, txid,
       });
 
-      // ── Signer → Vault: keep 0.006 SOL for gas ──
-      const keepForGas = 0.006;
-      const currentSignerBal = await conn.getBalance(wallet.publicKey);
-      const currentSignerSOL = currentSignerBal / LAMPORTS_PER_SOL;
-      const transferBack = currentSignerSOL - keepForGas;
-
-      if (transferBack > 0.001) {
-        try {
-          const vaultWallet = getVaultWallet();
-          const transferTx = new Transaction().add(
-            SystemProgram.transfer({
-              fromPubkey: wallet.publicKey,
-              toPubkey: vaultWallet.publicKey,
-              lamports: Math.floor(transferBack * LAMPORTS_PER_SOL),
-            })
-          );
-          await sendAndConfirmTransaction(conn, transferTx, [wallet]);
-          log('info', `Signer → Vault: ${transferBack.toFixed(4)} SOL (kept ${keepForGas} for gas)`);
-        } catch (transferErr) {
-          log('warn', `Signer → Vault transfer failed: ${transferErr.message}`);
-        }
-      }
-
-      const newBalance = await getBalance();
-      log('info', `Updated balance after buy: ${newBalance.toFixed(4)} SOL`);
-      return { success: true, txid, tokenAmount: actualTokens, pricePerToken, solSpent: actualSOL };
+      return { success: true, txid, tokenAmount, pricePerToken, solSpent: solAmount };
 
     } catch (err) {
       lastError = err;
       log('warn', `BUY attempt ${attempt + 1} failed: ${err.message}`);
       if (attempt < retries) {
-        await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
       }
     }
   }
@@ -208,6 +304,84 @@ export async function sellToken(mintAddress, tokenAmount, slippageBps = null, re
   const vaultWallet = getVaultWallet();
   let lastError;
 
+  // ── PRIMARY: Jupiter V1 quote+swap for speed and micro-amounts ──
+  log('info', `[V1-SELL] Requesting sell order: ${mintAddress.slice(0,8)}... → SOL (slippage: ${slippageBps ? slippageBps/100 : CONFIG.SLIPPAGE_PERCENT}%)`);
+  
+  try {
+    const amountRaw = Math.floor(tokenAmount);
+    const finalSlippageBps = slippageBps || (CONFIG.SLIPPAGE_PERCENT * 100);
+
+    // Step 1: Get quote from V1
+    const quoteParams = new URLSearchParams({
+      inputMint: mintAddress,
+      outputMint: SOL_MINT,
+      amount: String(amountRaw),
+      slippageBps: String(finalSlippageBps),
+    });
+    const quoteRes = await fetch(`https://api.jup.ag/swap/v1/quote?${quoteParams}`, {
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!quoteRes.ok) throw new Error(`V1 quote failed: ${quoteRes.status}`);
+    const quoteData = await quoteRes.json();
+    if (!quoteData.outAmount) throw new Error('V1: No quote available');
+
+    const solReceived = Number(quoteData.outAmount) / LAMPORTS_PER_SOL;
+    log('info', `[V1-SELL] Quote: ~${solReceived.toFixed(6)} SOL, impact: ${quoteData.priceImpactPct}%`);
+
+    // Step 2: Get swap transaction from V1
+    const swapRes = await fetch('https://api.jup.ag/swap/v1/swap', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        quoteResponse: quoteData,
+        userPublicKey: wallet.publicKey.toString(),
+        wrapAndUnwrapSol: true,
+        dynamicComputeUnitLimit: true,
+        prioritizationFeeLamports: 'auto',
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!swapRes.ok) throw new Error(`V1 swap failed: ${swapRes.status}`);
+    const swapData = await swapRes.json();
+
+    if (!swapData.swapTransaction) throw new Error('V1: No swap transaction returned');
+
+    // Step 3: Sign and send
+    const tx = VersionedTransaction.deserialize(Buffer.from(swapData.swapTransaction, 'base64'));
+    tx.sign([wallet]);
+    const signedTxRaw = tx.serialize();
+    const txid = await conn.sendRawTransaction(signedTxRaw, { skipPreflight: true, maxRetries: 2 });
+    await conn.confirmTransaction(txid, 'confirmed');
+
+    log('success', `SELL confirmed [V1]: ${solReceived.toFixed(6)} SOL received (tx: ${txid.slice(0,8)}...)`);
+    logTrade({ type: 'sell', mint: mintAddress, solReceived, tokenAmount, txid });
+
+    // Transfer proceeds to vault (keep a small buffer for gas)
+    const currentBalance = await conn.getBalance(wallet.publicKey);
+    const afterSellBalance = currentBalance / LAMPORTS_PER_SOL;
+    const keepForGas = 0.006;
+    const transferAmount = afterSellBalance - keepForGas;
+
+    if (transferAmount > 0.001) {
+      try {
+        const transferTx = new Transaction().add(SystemProgram.transfer({
+          fromPubkey: wallet.publicKey,
+          toPubkey: vaultWallet.publicKey,
+          lamports: Math.floor(transferAmount * LAMPORTS_PER_SOL),
+        }));
+        await sendAndConfirmTransaction(conn, transferTx, [wallet]);
+        log('info', `Transferred ${transferAmount.toFixed(4)} SOL to vault`);
+      } catch (transferErr) {
+        log('warn', `Transfer to vault failed: ${transferErr.message}`);
+      }
+    }
+
+    return { success: true, txid, solReceived, transferredToVault: transferAmount > 0.001 ? transferAmount : 0 };
+  } catch (v1Err) {
+    log('warn', `V1 SELL failed, attempting V2 fallback... Error: ${v1Err.message}`);
+  }
+
+  // ── FALLBACK: Jupiter V2 (Original logic) ──
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const amountRaw = Math.floor(tokenAmount);
@@ -226,16 +400,21 @@ export async function sellToken(mintAddress, tokenAmount, slippageBps = null, re
       // ── Sign ──
       const tx = VersionedTransaction.deserialize(Buffer.from(order.transaction, 'base64'));
       tx.sign([wallet]);
-      const signedTxBase64 = Buffer.from(tx.serialize()).toString('base64');
+      const signedTxRaw = tx.serialize();
 
-      // ── Execute via Jupiter (managed landing) ──
-      const result = await jupiterV2Execute(signedTxBase64, order.requestId);
-
-      if (result.status !== 'Success') {
-        throw new Error(`Jupiter /execute sell failed: code=${result.code} ${result.error || ''}`);
+      let txid;
+      if (CONFIG.USE_MANAGED_LANDING) {
+        const signedTxBase64 = Buffer.from(signedTxRaw).toString('base64');
+        const result = await jupiterV2Execute(signedTxBase64, order.requestId);
+        if (result.status !== 'Success') {
+          throw new Error(`Jupiter /execute sell failed: code=${result.code} ${result.error || ''}`);
+        }
+        txid = result.signature;
+      } else {
+        log('info', `[V2] Manual sell broadcast (cap: ${CONFIG.MAX_PRIORITY_FEE_SOL} SOL)...`);
+        txid = await conn.sendRawTransaction(signedTxRaw, { skipPreflight: true, maxRetries: 2 });
+        await conn.confirmTransaction(txid, 'confirmed');
       }
-
-      const txid = result.signature;
       const actualSOL = Number(result.outputAmountResult) / LAMPORTS_PER_SOL || solReceived;
 
       log('success', `SELL confirmed [V2]: ${actualSOL.toFixed(6)} SOL received (tx: ${txid.slice(0,8)}...)`);
@@ -279,22 +458,28 @@ export async function sellToken(mintAddress, tokenAmount, slippageBps = null, re
     }
   }
 
-  log('error', `SELL failed after ${retries + 1} attempts: ${lastError?.message}`);
+  log('error', `SELL V2 failed after ${retries + 1} attempts: ${lastError?.message}`);
   return { success: false, error: lastError?.message };
 }
 
 async function getQuote(inputMint, outputMint, amount, liquidityUSD = 0) {
-  const slippageBps = CONFIG.DYNAMIC_SLIPPAGE 
-    ? calculateDynamicSlippage(liquidityUSD) * 100
-    : CONFIG.SLIPPAGE_PERCENT * 100;
+  let slippageBps;
+  if (CONFIG.DYNAMIC_SLIPPAGE) {
+    slippageBps = calculateDynamicSlippage(liquidityUSD) * 100;
+  } else {
+    slippageBps = CONFIG.SLIPPAGE_PERCENT * 100;
+  }
 
   try {
     const params = new URLSearchParams({
       inputMint,
       outputMint,
-      amount: amount.toString(),
-      slippageBps: slippageBps.toString()
+      amount: amount.toString()
     });
+
+    if (slippageBps > 0) {
+      params.set('slippageBps', slippageBps.toString());
+    }
 
     const headers = { 'Accept': 'application/json' };
     if (CONFIG.JUPITER_API_KEY) headers['x-api-key'] = CONFIG.JUPITER_API_KEY;
@@ -475,4 +660,42 @@ async function paperSell(mintAddress, tokenAmount) {
 
 export function getPaperPrice(mintAddress) {
   return PAPER_PRICES.get(mintAddress);
+}
+
+/**
+ * Reclaim SOL rent by closing an empty token account.
+ */
+export async function reclaimRent(mintAddress) {
+  if (CONFIG.PAPER_TRADING) return { success: true };
+  
+  try {
+    const wallet = getWallet();
+    const conn = getConnection();
+    const mintPubkey = new PublicKey(mintAddress);
+    const ata = await getAssociatedTokenAddress(mintPubkey, wallet.publicKey);
+    
+    // Check if account has 0 balance before closing
+    const info = await conn.getTokenAccountBalance(ata).catch(() => null);
+    if (info && info.value.uiAmount > 0) {
+      log('warn', `Cannot reclaim rent for ${mintAddress.slice(0,8)}: balance is ${info.value.uiAmount}`);
+      return { success: false, reason: 'balance_not_zero' };
+    }
+
+    const tx = new Transaction().add(
+      createCloseAccountInstruction(
+        ata,
+        wallet.publicKey, // destination
+        wallet.publicKey  // owner
+      )
+    );
+    
+    const sig = await sendAndConfirmTransaction(conn, tx, [wallet]);
+    log('success', `Rent reclaimed (~0.002 SOL) for ${mintAddress.slice(0,8)}... (tx: ${sig.slice(0,8)}...)`);
+    return { success: true, signature: sig };
+  } catch (err) {
+    // If account doesn't exist, ignore
+    if (err.message.includes('could not find account')) return { success: true };
+    log('warn', `Rent reclamation failed for ${mintAddress.slice(0,8)}: ${err.message}`);
+    return { success: false, error: err.message };
+  }
 }

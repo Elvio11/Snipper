@@ -1,143 +1,103 @@
-# ⚡ Solana Meme Sniper Bot
+# ⚡ Solana Sniper Bot
 
-Monitors Raydium for new liquidity pools, runs safety checks, and automatically buys/sells meme tokens.
-
----
-
-## ⚠️ Risk Warning
-
-Meme coin trading is **extremely high risk**. Most tokens go to zero. This bot does not guarantee profits. With $5 (~0.03 SOL), one bad trade can eliminate your entire capital. **Only use funds you can afford to lose completely.**
+A high-performance Solana sniper bot designed for micro-cap tokens on Raydium and Pump.fun, utilizing Jupiter V1/V2 for optimized execution and a dual-wallet security model.
 
 ---
 
-## Setup
+## 🚀 Key Features
+
+- **Multi-Source Monitoring**: Scans Helius, Shinobi WebSocket, and DexScreener for new liquidity pools.
+- **Dual-Wallet Security**: Uses a **Vault** (holds funds) and a **Signer** (executes trades). Automatically refills the Signer with gas SOL to keep your main private key offline/safe.
+- **Jupiter V1/V2 Logic**: Prioritizes Jupiter V1 (Quote/Swap) for micro-amounts to avoid "Amount Too Small" errors, with V2 fallback for reliability.
+- **Graduated Scaling**: Automatically grows trade size as your bankroll increases (Compounding mode).
+- **Deep Safety Filters**:
+  - **RugCheck.xyz**: Real-time safety score verification.
+  - **Honeypot Simulation**: Verifies "sellability" via Jupiter quotes before buying.
+  - **Contract Checks**: Mint authority, Freeze authority, and LP Burn verification.
+- **Dynamic Slippage**: Adjusts slippage based on network volatility and pool depth.
+
+---
+
+## 🛠️ Setup
 
 ### 1. Prerequisites
-- Node.js 18+
-- A Solana wallet (Phantom recommended)
-- SOL for trading + gas fees
+- [Node.js](https://nodejs.org/) 18+
+- Two Solana Wallets (One for Vault, one for Signer).
 
-### 2. Install
+### 2. Installation
 ```bash
 npm install
 ```
 
-### 3. Configure
+### 3. Configuration
+Copy the template and fill in your details:
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env`:
+**Essential variables to set:**
+- `PRIVATE_KEY`: Your Vault wallet private key.
+- `RPC_URL`: A high-quality RPC (Helius, QuickNode, or Triton).
+- `HELIUS_API_KEY`: Required for advanced pool monitoring.
 
-| Variable | Description |
-|---|---|
-| `PRIVATE_KEY` | Your wallet private key (base58, from Phantom → Settings → Export Private Key) |
-| `RPC_URL` | Solana RPC endpoint — **use a paid one for speed** |
-| `BUY_AMOUNT_SOL` | SOL to spend per trade (e.g. `0.01`) |
-| `TAKE_PROFIT_MULTIPLIER` | Sell when price hits Nx entry (e.g. `3` = 3x) |
-| `STOP_LOSS_PERCENT` | Sell when price drops X% (e.g. `40`) |
-
-### 4. Get a fast RPC (critical)
-
-Free RPCs are too slow — you'll lose to other bots. Get a free API key from:
-- **Helius** — https://helius.xyz (recommended, generous free tier)
-- **QuickNode** — https://quicknode.com
-- **Triton** — https://triton.one
-
-Then set in `.env`:
+### 4. Generate Signer Wallet
+Run this utility to generate a fresh signer wallet and get its address:
+```bash
+node scripts/generate-signer.js
 ```
-RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
-```
+Then add the private key to `SIGNER_PRIVATE_KEY` in `.env`.
 
 ---
 
-## Usage
+## 📈 Usage
 
-### Paper trading (no real money — START HERE)
+### Paper Trading (Simulation)
+Test your strategy without risking real SOL:
 ```bash
 npm run paper
-# or
-node src/index.js --paper
 ```
 
-### Live trading
+### Live Trading
+Start the sniper bot with PM2 for automatic restarts:
+```bash
+pm2 start ecosystem.config.cjs
+```
+Or run directly:
 ```bash
 npm start
 ```
 
 ---
 
-## How It Works
+## 🛡️ Security Model: Signer vs Vault
 
-```
-New Raydium pool detected (WebSocket)
-         ↓
-  Liquidity check ($1K–$500K)
-         ↓
-  LP burn % check (optional)
-         ↓
-  Token safety analysis:
-    • Mint authority revoked?
-    • Freeze authority revoked?
-    • Honeypot simulation (Jupiter quote)
-         ↓
-  BUY via Jupiter (best price routing)
-         ↓
-  Monitor price every 10 seconds
-         ↓
-  SELL at take-profit OR stop-loss
-```
+This bot implements a **Hot/Cold wallet hybrid**:
+1. **Vault (Cold)**: Stores your SOL. The bot only reads from here to check bankroll and sends gas refills.
+2. **Signer (Hot)**: Holds only enough SOL for gas and the tokens currently being traded.
+If the bot's environment is compromised, the majority of your funds stay safe in the Vault.
 
 ---
 
-## Safety Filters
+## 📊 Graduated Scaling
 
-| Check | What it catches |
-|---|---|
-| Mint authority | Devs printing infinite tokens |
-| Freeze authority | Devs freezing your wallet |
-| Honeypot simulation | Tokens you can buy but not sell |
-| Liquidity range | Too small (rug) or too pumped |
-| LP burn % | Devs who can pull liquidity |
+Enable `USE_GRADUATED_SCALING=true` to allow the bot to manage its own position sizing.
+It uses the formula: `Bankroll * (Fraction / MaxPositions)`.
+As you win trades, the bot will gradually increase the `BUY_AMOUNT_SOL` up to your defined caps.
 
 ---
 
-## Recommended Settings for $5
+## 📂 File Structure
 
-```env
-BUY_AMOUNT_SOL=0.008          # ~$1.30 per trade
-TAKE_PROFIT_MULTIPLIER=4      # sell at 4x
-STOP_LOSS_PERCENT=35          # cut losses at -35%
-MAX_POSITIONS=2               # never hold more than 2
-MIN_LIQUIDITY_USD=2000        # avoid micro-rugs
-REQUIRE_FREEZE_REVOKED=true
-HONEYPOT_CHECK=true
-```
+- `index.js`: Main loop and orchestrator.
+- `executor.js`: Jupiter execution logic (V1/V2).
+- `monitor.js`: Pool detection and signal filtering.
+- `safety.js`: Rug detection and honeypot checks.
+- `positions.js`: Real-time TP/SL monitoring and P&L tracking.
+- `wallet.js`: Multi-wallet management and gas refilling.
+- `config.js`: Configuration and scaling logic.
 
 ---
 
-## Files
+## ⚠️ Disclaimer
 
-```
-src/
-  index.js      — Main orchestrator
-  monitor.js    — Raydium WebSocket pool watcher
-  safety.js     — Token safety analysis
-  executor.js   — Jupiter buy/sell execution
-  positions.js  — Position tracking + P&L
-  price.js      — Price feeds
-  wallet.js     — Wallet + connection
-  config.js     — Config loader
-  logger.js     — Logging
-
-logs/
-  trades.log    — All trade history (JSON)
-  positions.json — Open/closed positions
-  error.log     — Errors
-```
-
----
-
-## Logs
-
-All trades are saved to `logs/positions.json`. Each entry includes entry price, exit price, P&L in SOL, and close reason (take_profit / stop_loss).
+Trading meme coins on Solana involves extreme risk. This bot is provided for educational purposes. Use at your own risk. The developers are not responsible for any financial losses.
