@@ -242,6 +242,9 @@ class DexScreenerService {
       success: true,
       data: {
         liquidityUSD: pair.liquidity?.usd || 0,
+        liquidityQuote: pair.liquidity?.quote || 0,
+        quoteTokenSymbol: pair.quoteToken?.symbol || '',
+        quoteTokenAddress: pair.quoteToken?.address || '',
         volume24h: pair.volume?.h24 || 0,
         priceNative: pair.priceNative,
         priceUSD: pair.priceUsd,
@@ -249,6 +252,7 @@ class DexScreenerService {
         freezeAuth: pair.tokenApproval?.freezeAuthority || null,
         pairAddress: pair.pairAddress,
         dexId: pair.dexId,
+        pairCreatedAt: pair.pairCreatedAt || 0,
       }
     };
   }
@@ -260,13 +264,18 @@ class DexScreenerService {
       return { success: false };
     }
     
-    const pair = result.data[0];
+    // Find the best pair (usually highest liquidity or SOL pair)
+    const pairs = result.data;
+    const solPair = pairs.find(p => p.quoteToken?.address === 'So11111111111111111111111111111111111111112') || pairs[0];
+
     return {
       success: true,
       data: {
-        priceNative: parseFloat(pair.priceNative || 0),
-        priceUSD: parseFloat(pair.priceUsd || 0),
-        liquidityUSD: pair.liquidity?.usd || 0,
+        priceNative: parseFloat(solPair.priceNative || 0),
+        priceUSD: parseFloat(solPair.priceUsd || 0),
+        liquidityUSD: solPair.liquidity?.usd || 0,
+        quoteToken: solPair.quoteToken?.symbol || '',
+        quoteAddress: solPair.quoteToken?.address || '',
       }
     };
   }

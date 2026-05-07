@@ -23,11 +23,11 @@ describe('E2E - New Token Discovery Flow', () => {
     });
 
     it('should handle sell with estimated prices', async () => {
-      // First buy - will fail (no price)
-      await buyToken(newTokenMint, 0.01, null);
+      // First buy - uses fallback price
+      const buyResult = await buyToken(newTokenMint, 0.01, null);
       
-      // Then sell - may or may not have current price
-      const sellResult = await sellToken(newTokenMint, 1000000);
+      // Then sell the bought amount
+      const sellResult = await sellToken(newTokenMint, buyResult.tokenAmount);
       
       if (!sellResult.success) {
         console.log('❌ Sell failed:', sellResult.error);

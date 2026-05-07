@@ -12,6 +12,7 @@ import { PoolService } from './src/services/pool.js';
 import { getTokenPriceInSOL, getPoolLiquidityUSD, getPriceFromPool } from './price.js';
 import { initTelegram, sendAlert, setPositionManager } from './telegram.js';
 import { shinobiWS } from './shinobi-ws.js';
+import { startDashboard, broadcast, setPositionManager as setDashboardPositionManager, setWalletProvider } from './dashboard-api.js';
 
 
 // ─── Global Error Handlers ──────────────────────────────────────────────────
@@ -79,6 +80,9 @@ function printBanner() {
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function main() {
+  // Start the Real-time Dashboard
+  startDashboard();
+
   printBanner();
 
   // Validate config
@@ -110,6 +114,31 @@ async function main() {
   positions = new PositionManager();
   await positions.clearStalePositions();
   setPositionManager(positions);
+  setDashboardPositionManager(positions);
+  setWalletProvider(async () => {
+    const s = await getSOLBalance();
+    const v = await getVaultBalance();
+    return { signer: s, vault: v };
+  });
+
+  // Initial sync to dashboard
+  const initialSummary = positions.getSummary();
+  broadcast('stats', initialSummary);
+  broadcast('positions', Array.from(positions.positions.values()));
+  
+  // Wallet updates
+  const updateWallet = async () => {
+    try {
+      const sBal = await getSOLBalance();
+      const vBal = await getVaultBalance();
+      broadcast('wallet', { signer: sBal, vault: vBal });
+    } catch (e) {
+      log('warn', `Failed to update wallet balances: ${e.message}`);
+    }
+  };
+  
+  await updateWallet();
+  setInterval(updateWallet, 30000); // Update wallet every 30s
 
   monitor   = new PoolMonitor();
   let isBuying = false;
@@ -147,7 +176,7 @@ async function main() {
     // Add to queue if not full
     if (tokenQueue.length < MAX_QUEUE_SIZE) {
       tokenQueue.push({ tokenMint, poolId, liquidityUSD, source: poolInfo.source });
-      log('snipe', `[QUEUE] Added ${tokenMint.slice(0,8)}... to queue (${tokenQueue.length}/${MAX_QUEUE_SIZE})`);
+      log('snipe', `[QUEUE] Added ${tokenMint} to queue (${tokenQueue.length}/${MAX_QUEUE_SIZE})`);
       return true;
     }
     return false;
@@ -165,26 +194,26 @@ async function main() {
       const current = tokenQueue.shift();
       const { tokenMint, poolId, liquidityUSD } = current;
       
-      log('snipe', `[QUEUE] Processing ${tokenMint.slice(0,8)}... (${tokenQueue.length} remaining)`);
+      log('snipe', `[QUEUE] Processing ${tokenMint} (${tokenQueue.length} remaining)`);
       
       // Analyze this token
-      const analysis = await analyzeToken(tokenMint);
+      const analysis = await analyzeToken(tokenMint, current);
       
       if (!analysis.safe) {
-        // Permanently block honeypots
+        // Permanently block tokens that fail hard safety checks
         permanentlyBlocked.add(tokenMint);
-        log('warn', `[QUEUE] ❌ ${tokenMint.slice(0,8)}... is honeypot - permanently blocked`);
+        log('warn', `[QUEUE] ❌ ${tokenMint} failed security checks - permanently blocked`);
         continue; // Move to next in queue
       }
       
-      if (analysis.score < 40) {
+      if (analysis.score < CONFIG.MIN_SAFETY_SCORE) {
         permanentlyBlocked.add(tokenMint);
-        log('warn', `[QUEUE] ❌ ${tokenMint.slice(0,8)}... score too low - permanently blocked`);
+        log('warn', `[QUEUE] ❌ ${tokenMint} score too low (${analysis.score}) - permanently blocked`);
         continue; // Move to next in queue
       }
       
       // Token is SAFE - proceed to buy
-      log('info', `[QUEUE] ✅ ${tokenMint.slice(0,8)}... passed security checks!`);
+      log('info', `[QUEUE] ✅ ${tokenMint} passed security checks!`);
       
       const signerBalance = await getSOLBalance();
       const vaultBalance = await getVaultBalance();
@@ -194,7 +223,7 @@ async function main() {
         ? getDynamicBuyAmount(totalBalance, CONFIG._solPrice || 90, vaultBalance, closedPnL)
         : CONFIG.BUY_AMOUNT_SOL;
       
-      if (totalBalance < buyAmount + 0.005) {
+      if (totalBalance < buyAmount + CONFIG.VAULT_MIN_BALANCE_SOL) {
         log('warn', `[QUEUE] Insufficient balance - clearing queue`);
         tokenQueue = [];
         break;
@@ -247,7 +276,12 @@ async function main() {
           pricePerToken: result.pricePerToken,
           solSpent: result.solSpent,
           poolId,
+          decimals: result.decimals || 6
         });
+
+        // Immediate UI update
+        broadcast('positions', Array.from(positions.positions.values()));
+        broadcast('stats', positions.getSummary());
         
         sendAlert('buy', {
           mint: tokenMint,
@@ -314,7 +348,6 @@ async function main() {
   }
 
   // ─── Position monitoring loop ───────────────────────────────────────────
-  let lastMonitoredPrices = {};
   let isMonitoring = false;
   let lastRetryTime = 0;
   let _pollCounter = 0;
@@ -352,42 +385,8 @@ async function main() {
         log('info', `  ⏳ Waiting for new pools... (scanning)`);
       }
     }
-    
-    // Check positions and track price changes + execute TP/SL
-    for (const [mint, pos] of positions.getOpenPositions()) {
-      if (pos.status !== 'open') continue;
-      
-      // Use entry price if no fresh price available
-      let currentPrice = await getTokenPriceInSOL(mint, pos.poolId);
-      if (!currentPrice) {
-        currentPrice = pos.entryPrice;
-      }
-      
-      try {
-        const pnlPercent = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
-        const prevPrice = lastMonitoredPrices[mint];
-        const priceChange = prevPrice ? ((currentPrice - prevPrice) / prevPrice) * 100 : 0;
-        
-        lastMonitoredPrices[mint] = currentPrice;
-        
-        const sign = pnlPercent >= 0 ? '+' : '';
-        const arrow = priceChange > 0 ? '▲' : priceChange < 0 ? '▼' : '─';
-        const changeSign = priceChange >= 0 ? '+' : '';
-        
-        log('info', `  ${mint.slice(0, 6)}... ${arrow} ${sign}${pnlPercent.toFixed(1)}% (${changeSign}${priceChange.toFixed(1)}%) | ${currentPrice.toExponential(3)}`);
-      } catch (err) {
-        log('error', `  Price check error for ${mint.slice(0, 6)}...: ${err.message}`);
-      }
-    }
-
-    // Process TP/SL for all open positions
-    await positions.checkAll(async (mint, poolId) => {
-      const price = await getTokenPriceInSOL(mint, poolId);
-      if (!price) {
-        return await getPriceFromPool(poolId);
-      }
-      return price;
-    });
+    // Process TP/SL and track price changes for all open positions
+    await positions.checkAll();
   } finally {
     isMonitoring = false;
   }
@@ -411,6 +410,15 @@ async function main() {
       }
       log('info', '═══════════════════════════════════════════════════');
       console.log();
+
+      // Push to dashboard
+      broadcast('stats', summary);
+      broadcast('positions', Array.from(positions.positions.values())); // Keep positions synced
+      getSOLBalance().then(b => getVaultBalance().then(v => broadcast('wallet', { signer: b, vault: v })));
+    } else {
+      // Even if no trades, keep wallet and positions synced
+      broadcast('positions', Array.from(positions.positions.values()));
+      getSOLBalance().then(b => getVaultBalance().then(v => broadcast('wallet', { signer: b, vault: v })));
     }
     
     // Every 60 seconds, retry any positions that failed to close
@@ -422,7 +430,7 @@ async function main() {
       }).catch(err => log('error', `Retry failed: ${err.message}`));
       lastRetryTime = Date.now();
     }
-  }, 60_000); // every minute
+  }, 5_000); // every 5 seconds for real-time dashboard
 
   // ─── Check existing positions on startup ─────────────────────────────────
   const allExisting = [...positions.positions.entries()];
@@ -450,13 +458,7 @@ async function main() {
     }
     
     // Use positions.checkAll which handles staged TP and SL
-    await positions.checkAll(async (mint, poolId) => {
-      const price = await getTokenPriceInSOL(mint, poolId);
-      if (!price) {
-        return await getPriceFromPool(poolId);
-      }
-      return price;
-    });
+    await positions.checkAll();
     
     // Start monitoring mode if we still have open positions
     if (positions.count() > 0) {
@@ -526,7 +528,12 @@ async function main() {
           pricePerToken: price || result.pricePerToken,
           solSpent: result.solSpent,
           poolId: null,
+          decimals: result.decimals || 6
         });
+
+        // Immediate UI update
+        broadcast('positions', Array.from(positions.positions.values()));
+        broadcast('stats', positions.getSummary());
 
         sendAlert('buy', {
           mint: tokenAddress,

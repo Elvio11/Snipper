@@ -1,4 +1,5 @@
 import { log } from './logger.js';
+import { CONFIG } from './config.js';
 
 const RUGCHECK_API = 'https://api.rugcheck.xyz/v1';
 
@@ -90,7 +91,7 @@ function parseRugCheckReport(data) {
   else                   rating = 'Danger';
 
   const dangerFlags = flags.filter(f => f.level === 'danger');
-  const safe = dangerFlags.length === 0 && score >= 500;
+  const safe = dangerFlags.length === 0 && score >= (CONFIG.RUGCHECK_MIN_SCORE || 500);
 
   return {
     safe,

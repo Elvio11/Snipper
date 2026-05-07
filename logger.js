@@ -2,6 +2,7 @@ import winston from 'winston';
 import chalk from 'chalk';
 import fs from 'fs';
 import path from 'path';
+import { broadcast } from './dashboard-api.js';
 
 let dailyRotateAvailable = false;
 try {
@@ -77,5 +78,9 @@ export function log(level, msg, data = null) {
   const line  = `${chalk.gray(time)} ${color(icon + ' ' + msg)}`;
   console.log(line);
   if (data) console.log(chalk.gray(JSON.stringify(data, null, 2)));
+
+  // Mirror to dashboard
+  broadcast('log', { level, msg, data, time });
+
   logger.info({ level, msg, data });
 }

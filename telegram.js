@@ -2,7 +2,7 @@ import TelegramBot from 'node-telegram-bot-api';
 import { log } from './logger.js';
 import { getTokenMetadata, getTokenName } from './tokenMetadata.js';
 import { CONFIG } from './config.js';
-import { PositionManager } from './positions.js';
+// Removed PositionManager import to break circular dependency
 
 let bot = null;
 let chatId = null;
@@ -21,8 +21,8 @@ function escapeMarkdownV2(text) {
 }
 
 export async function initTelegram() {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  chatId = process.env.TELEGRAM_CHAT_ID;
+  const token = CONFIG.TELEGRAM_BOT_TOKEN;
+  chatId = CONFIG.TELEGRAM_CHAT_ID;
 
   if (!token) {
     log('warn', 'Telegram not configured - notifications disabled');
@@ -239,7 +239,7 @@ async function sendPositions(chatId, editMsgId = null) {
     const pnlPercent = ((pos.pnlSOL || 0) / pos.solSpentOriginal * 100) || 0;
     const pnlEmoji = pnlPercent >= 0 ? '🟢' : '🔴';
 
-    message += `${pnlEmoji} *${mint.slice(0, 8)}...*\n`;
+    message += `${pnlEmoji} *${mint}...*\n`;
     message += `  Spent: ${pos.solSpentOriginal.toFixed(4)} SOL\n`;
     message += `  P&L: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(1)}% (${pos.pnlSOL >= 0 ? '+' : ''}${(pos.pnlSOL || 0).toFixed(4)} SOL)\n`;
     message += `  Sold: ${pos.totalSoldPercent || 0}%\n`;
@@ -387,7 +387,7 @@ async function closePosition(chatId, mint) {
 
   try {
     await positionManager.closePosition(mint, 'manual');
-    await bot.sendMessage(chatId, `✅ Position ${mint.slice(0, 8)}... closed`);
+    await bot.sendMessage(chatId, `✅ Position ${mint}... closed`);
   } catch (err) {
     await bot.sendMessage(chatId, `❌ Error closing position: ${err.message}`);
   }

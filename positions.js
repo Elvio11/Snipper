@@ -3,16 +3,18 @@ import { CONFIG } from './config.js';
 import { log } from './logger.js';
 import { sendAlert } from './telegram.js';
 import { PoolService } from './src/services/pool.js';
+import { broadcast } from './dashboard-api.js';
 
 import { LAMPORTS_PER_SOL } from '@solana/web3.js';
 import fs from 'fs';
 
 const POSITIONS_FILE = './logs/positions.json';
-import { getPoolLiquidityUSD } from './price.js';
+import * as PriceService from './price.js';
 
 export class PositionManager {
   constructor() {
     this.positions = this._load();
+    this.lastPrices = new Map();
     
     // Migrate existing positions - add takeProfitAt if missing
     for (const [mint, pos] of this.positions) {
@@ -88,13 +90,16 @@ export class PositionManager {
     }
   }
 
-  async add(mintAddress, { tokenAmount, pricePerToken, solSpent, poolId }) {
+  async add(mint, data) {
+    const { tokenAmount, pricePerToken, solSpent, poolId, decimals } = data;
+    
     const pos = {
-      mintAddress,
+      mint,
       poolId,
       tokenAmount,
       tokenAmountOriginal: tokenAmount,
       entryPrice: pricePerToken,
+      decimals: decimals || 6,
       solSpent,
       solSpentOriginal: solSpent,
       openedAt: Date.now(),
@@ -106,11 +111,12 @@ export class PositionManager {
       totalSoldAmount: 0,
     };
 
-    this.positions.set(mintAddress, pos);
+    this.positions.set(mint, pos);
     this._save();
+    broadcast('positions', Array.from(this.positions.values()));
 
     const stageInfo = pos.sellStages.map(s => `${s.multiplier}x (${s.percent}%)`).join(', ');
-    log('trade', `Position opened: ${mintAddress.slice(0, 8)}...`, {
+    log('trade', `Position opened: ${mint.slice(0, 8)}...`, {
       spent: `${solSpent} SOL`,
       stages: stageInfo,
       stopLoss: `${pos.stopLossAt.toExponential(3)} SOL`,
@@ -119,8 +125,8 @@ export class PositionManager {
     return pos;
   }
 
-  get(mintAddress) {
-    return this.positions.get(mintAddress);
+  get(mint) {
+    return this.positions.get(mint);
   }
 
   count() {
@@ -131,13 +137,14 @@ export class PositionManager {
     return [...this.positions.entries()].filter(([, p]) => p.status === 'open');
   }
 
-  async checkAll(getPriceFn) {
+  async checkAll() {
     for (const [mint, pos] of this.positions) {
       if (pos.status !== 'open') continue;
       try {
-        const currentPrice = await getPriceFn(pos.mintAddress, pos.poolId);
+        const remainingAmount = Math.floor(pos.tokenAmountOriginal - (pos.totalSoldAmount || 0));
+        let currentPrice = await PriceService.getTokenPriceInSOL(mint, pos.poolId, true, remainingAmount, pos.decimals || 9);
         if (!currentPrice) {
-          log('info', `  ${mint.slice(0, 8)}... | Waiting for price data...`);
+          log('info', `  ${mint}... | Waiting for price data...`);
           continue;
         }
 
@@ -152,6 +159,14 @@ export class PositionManager {
 
         const pnlPercent = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
 
+        // Sanity check: If price jumps >100x (10000%) in a single check, log warning and double-check
+        if (pnlPercent > 10000 && !pos._highPriceWarning) {
+          log('warn', `⚠️ EXTREME PRICE SPIKE on ${mint.slice(0,8)}: ${currentPrice.toExponential(3)} SOL (+${pnlPercent.toFixed(1)}%). Verifying...`);
+          pos._highPriceWarning = true; // Skip this check, will verify on next tick
+          continue;
+        }
+        pos._highPriceWarning = false;
+
         const slPercent = CONFIG.STOP_LOSS_PERCENT;
         const actualSL = pos.entryPrice * (1 - slPercent / 100);
         
@@ -159,7 +174,7 @@ export class PositionManager {
         const isStopLoss = currentPrice < actualSL;
 
         if (isStopLoss) {
-          log('warn', `🛑 STOP LOSS on ${mint.slice(0, 8)}... (entry: ${pos.entryPrice.toExponential(3)}, current: ${currentPrice.toExponential(3)}, SL: ${actualSL.toExponential(3)})`);
+          log('warn', `🛑 STOP LOSS on ${mint}... (entry: ${pos.entryPrice.toExponential(3)}, current: ${currentPrice.toExponential(3)}, SL: ${actualSL.toExponential(3)})`);
           await this._closeRemaining(mint, pos, 'stop_loss');
           sendAlert('sell_sl', { mint, profitPercent: -CONFIG.STOP_LOSS_PERCENT, pnlSol: pos.pnlSOL });
           continue;
@@ -169,10 +184,12 @@ export class PositionManager {
         if (CONFIG.SELL_MODE === 'instant') {
           const targetPrice = pos.entryPrice * CONFIG.INSTANT_TP_MULTIPLIER;
           if (currentPrice >= targetPrice) {
-            log('success', `🎯 INSTANT SELL (${CONFIG.INSTANT_TP_MULTIPLIER}x) on ${mint.slice(0,8)}... (+${pnlPercent.toFixed(1)}%)`);
+            log('success', `🎯 INSTANT SELL TRIGGERED: ${mint.slice(0,8)}...`);
+            log('info', `  Entry: ${pos.entryPrice.toExponential(3)} | Current: ${currentPrice.toExponential(3)} | Target: ${targetPrice.toExponential(3)} (+${pnlPercent.toFixed(1)}%)`);
+            
             let sellSlippageBps = CONFIG.SLIPPAGE_PERCENT * 100;
             try {
-              const liqUSD = await getPoolLiquidityUSD(pos.poolId);
+              const liqUSD = await PriceService.getPoolLiquidityUSD(pos.poolId);
               if (liqUSD > 0) sellSlippageBps = calculateDynamicSlippage(liqUSD) * 100;
             } catch (e) {}
             const result = await sellToken(mint, pos.tokenAmountOriginal - pos.totalSoldAmount, sellSlippageBps);
@@ -197,11 +214,11 @@ export class PositionManager {
               const sellAmount = pos.tokenAmountOriginal * (sellPercent / 100);
               const costOfSold = pos.solSpentOriginal * (sellPercent / 100);
               
-              log('success', `🎯 TP ${stage.multiplier}x (${sellPercent}%) on ${mint.slice(0, 8)}... (+${pnlPercent.toFixed(1)}%)`);
+              log('success', `🎯 TP ${stage.multiplier}x (${sellPercent}%) on ${mint}... (+${pnlPercent.toFixed(1)}%)`);
               
               let sellSlippageBps = CONFIG.SLIPPAGE_PERCENT * 100;
               try {
-                const liqUSD = await getPoolLiquidityUSD(pos.poolId);
+                const liqUSD = await PriceService.getPoolLiquidityUSD(pos.poolId);
                 if (liqUSD > 0) sellSlippageBps = calculateDynamicSlippage(liqUSD) * 100;
               } catch (e) {}
               const result = await sellToken(mint, sellAmount, sellSlippageBps);
@@ -218,11 +235,12 @@ export class PositionManager {
               log('info', `  Sold ${sellPercent}% (${sellAmount.toFixed(4)} tokens) for ${solReceived.toFixed(4)} SOL (cost: ${costOfSold.toFixed(4)} SOL, profit: ${profitFromSale.toFixed(4)} SOL)`);
 
               if (pos.totalSoldPercent >= 100 || pos.tokenAmount <= 0) {
-                log('success', `✅ All positions sold on ${mint.slice(0, 8)}...`);
+                log('success', `✅ All positions sold on ${mint}...`);
                 await this._closeFully(mint, pos, 'take_profit');
                 sendAlert('sell_tp', { mint, profitPercent: pnlPercent, pnlSol: pos.pnlSOL });
               } else {
                 this._save();
+                broadcast('positions', Array.from(this.positions.values()));
               }
               soldThisCheck = true;
               break;
@@ -230,8 +248,15 @@ export class PositionManager {
           }
 
           if (!soldThisCheck) {
+            const prevPrice = this.lastPrices.get(mint);
+            const priceChange = prevPrice ? ((currentPrice - prevPrice) / prevPrice) * 100 : 0;
+            this.lastPrices.set(mint, currentPrice);
+
+            const arrow = priceChange > 0 ? '▲' : priceChange < 0 ? '▼' : '─';
             const sign = pnlPercent >= 0 ? '+' : '';
-            log('info', `  ${mint.slice(0, 8)}... ${sign}${pnlPercent.toFixed(1)}% | ${pos.totalSoldPercent}% sold | ${currentPrice.toExponential(3)}`);
+            const changeSign = priceChange >= 0 ? '+' : '';
+            
+            log('info', `  ${mint.slice(0, 6)}... ${arrow} ${sign}${pnlPercent.toFixed(1)}% (${changeSign}${priceChange.toFixed(1)}%) | ${currentPrice.toExponential(3)}`);
           }
         }
       } catch (err) {
@@ -246,7 +271,7 @@ export class PositionManager {
       log('warn', `No open position for ${mintAddress}`);
       return;
     }
-    log('warn', `Force closing: ${mintAddress.slice(0, 8)}...`);
+    log('warn', `Force closing: ${mintAddress}...`);
     await this._closeRemaining(mintAddress, pos, 'force_close');
   }
 
@@ -264,7 +289,7 @@ export class PositionManager {
     if (remainingTokens > 0) {
       let sellSlippageBps = CONFIG.SLIPPAGE_PERCENT * 100;
       try {
-        const liqUSD = await getPoolLiquidityUSD(pos.poolId);
+        const liqUSD = await PriceService.getPoolLiquidityUSD(pos.poolId);
         if (liqUSD > 0) sellSlippageBps = calculateDynamicSlippage(liqUSD) * 100;
       } catch (e) {}
       const result = await sellToken(mintAddress, remainingTokens, sellSlippageBps);
@@ -289,6 +314,7 @@ export class PositionManager {
     pos.closedAt = Date.now();
     pos.pnlPercent = ((pos.pnlSOL || 0) / pos.solSpentOriginal) * 100;
     this._save();
+    broadcast('positions', Array.from(this.positions.values()));
     this._logTrade(pos);
   }
 
@@ -300,7 +326,7 @@ export class PositionManager {
       // Try to sell remaining tokens first
       let sellSlippageBps = CONFIG.SLIPPAGE_PERCENT * 100;
       try {
-        const liqUSD = await getPoolLiquidityUSD(pos.poolId);
+        const liqUSD = await PriceService.getPoolLiquidityUSD(pos.poolId);
         if (liqUSD > 0) sellSlippageBps = calculateDynamicSlippage(liqUSD) * 100;
       } catch (e) {}
       const result = await sellToken(mintAddress, pos.tokenAmount, sellSlippageBps);
@@ -319,6 +345,7 @@ export class PositionManager {
     pos.closedAt = Date.now();
     pos.pnlPercent = ((pos.pnlSOL || 0) / pos.solSpentOriginal) * 100;
     this._save();
+    broadcast('positions', Array.from(this.positions.values()));
     this._logTrade(pos);
     
     // RECLAIM RENT: Close token account to get ~0.002 SOL back
@@ -367,8 +394,8 @@ export class PositionManager {
       openTrades: open.length,
       wins: wins.length,
       losses: losses.length,
-      winRate: closed.length > 0 ? (wins.length / closed.length * 100).toFixed(1) : '—',
-      totalPnLSOL: totalPnL.toFixed(4),
+      winRate: closed.length > 0 ? (wins.length / closed.length * 100) : 0,
+      totalPnLSOL: totalPnL,
       avgWin,
       avgLoss,
       totalPnL,

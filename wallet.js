@@ -12,8 +12,8 @@ let _signerWallet = null;
 let _rpcIndex = 0;
 
 // Paper trading simulated balances
-let _paperSignerBalance = 0.017;
-let _paperVaultBalance = 0.044;
+let _paperSignerBalance = 1.0;
+let _paperVaultBalance = 1.0;
 
 const RPC_URLS = [
   CONFIG.RPC_URL,
@@ -83,26 +83,43 @@ export async function withRetry(fn, maxRetries = 3, baseDelay = 500) {
 }
 
 /**
- * Decode a private key from either base58 or base64 format.
- * Tries base58 first (Phantom standard), falls back to base64 for legacy keys.
+ * Decode a private key from JSON array, base58, or base64 format.
+ * Prioritizes base58 (Phantom standard) to prevent "ghost wallet" generation.
  */
 function decodePrivateKey(keyString) {
-  // Try base58 first (Phantom/Solana standard)
+  if (!keyString) throw new Error('Private key is missing in .env');
+  const trimmed = keyString.trim();
+
+  // 1. Try JSON array format [1,2,3...] (Solana CLI standard)
+  if (trimmed.startsWith('[')) {
+    try {
+      const decoded = Uint8Array.from(JSON.parse(trimmed));
+      if (decoded.length === 64) return decoded;
+    } catch (e) {
+      log('error', `Failed to parse JSON private key: ${e.message}`);
+    }
+  }
+
+  // 2. Try base58 (Phantom/Solana standard) - RECOMMENDED
   try {
-    const decoded = bs58.decode(keyString);
+    const decoded = bs58.decode(trimmed);
     if (decoded.length === 64) return decoded;
   } catch {}
 
-  // Fallback: try base64 (legacy format from older generate-signer.js)
-  try {
-    const decoded = Buffer.from(keyString, 'base64');
-    if (decoded.length === 64) {
-      log('warn', 'Private key is base64-encoded. Consider re-exporting as base58 (Phantom standard).');
-      return decoded;
-    }
-  } catch {}
+  // 3. Fallback: try base64 (ONLY if it looks like base64)
+  if (trimmed.includes('+') || trimmed.includes('/') || trimmed.endsWith('=')) {
+    try {
+      const decoded = Buffer.from(trimmed, 'base64');
+      if (decoded.length === 64) {
+        log('warn', '--- WARNING: Legacy Base64 Key Detected ---');
+        log('warn', 'This format is deprecated and may lead to "ghost" addresses.');
+        log('warn', 'Please verify the address below matches your intended wallet.');
+        return decoded;
+      }
+    } catch {}
+  }
 
-  throw new Error('Invalid private key format. Expected base58 (Phantom) or base64.');
+  throw new Error('Invalid private key format. Please use the Base58 string provided by Phantom (Export Private Key).');
 }
 
 export function getVaultWallet() {
@@ -113,7 +130,7 @@ export function getVaultWallet() {
       const secret = decodePrivateKey(CONFIG.PRIVATE_KEY);
       _vaultWallet = Keypair.fromSecretKey(secret);
     }
-    log('info', `Vault wallet: ${_vaultWallet.publicKey.toString().slice(0, 8)}...`);
+    log('info', `Vault wallet loaded: ${_vaultWallet.publicKey.toBase58()}`);
   }
   return _vaultWallet;
 }
@@ -128,7 +145,7 @@ export function getSignerWallet() {
     } else {
       _signerWallet = getVaultWallet();
     }
-    log('info', `Signer wallet: ${_signerWallet.publicKey.toString().slice(0, 8)}...`);
+    log('info', `Signer wallet loaded: ${_signerWallet.publicKey.toBase58()}`);
   }
   return _signerWallet;
 }
@@ -202,7 +219,7 @@ export async function refillSignerFromVault() {
 
   const signerBal = await getSOLBalance();
   const vaultBal = await getVaultBalance();
-  const minSignerBal = CONFIG.SIGNER_MIN_BALANCE || 0.015;
+  const minSignerBal = CONFIG.SIGNER_MIN_BALANCE || 0.01;
   const refillAmount = CONFIG.SIGNER_REFILL_AMOUNT || 0.015;
 
   log('debug', `Refill check: signer=${signerBal.toFixed(6)}, vault=${vaultBal.toFixed(6)}, minSigner=${minSignerBal.toFixed(6)}, refill=${refillAmount.toFixed(6)}, combined=${(minSignerBal + refillAmount).toFixed(6)}`);
@@ -211,8 +228,9 @@ export async function refillSignerFromVault() {
     return { success: true, reason: 'sufficient_balance' };
   }
 
-  if (vaultBal <= minSignerBal + refillAmount) {
-    const msg = `Vault balance too low for refill: ${vaultBal.toFixed(6)} <= ${(minSignerBal + refillAmount).toFixed(6)}`;
+  if (vaultBal <= (CONFIG.VAULT_MIN_BALANCE_SOL || 0.005) + refillAmount) {
+    const floor = (CONFIG.VAULT_MIN_BALANCE_SOL || 0.005);
+    const msg = `Vault balance too low for refill: ${vaultBal.toFixed(6)} <= ${(floor + refillAmount).toFixed(6)} (floor: ${floor})`;
     log('warn', msg);
     return { success: false, reason: 'vault_low' };
   }

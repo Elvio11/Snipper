@@ -6,6 +6,7 @@ import { PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { getConnection } from '../../wallet.js';
 import { log } from '../../logger.js';
 import { dexService } from './dexscreener-service.js';
+import { CONFIG } from '../../config.js';
 
 const RAYDIUM_API = 'https://api-v3.raydium.io';
 const JUPITER_PRICE = 'https://api.jup.ag/price/v2';
@@ -180,9 +181,9 @@ static async _fetchPriceWithFallback(tokenMint, poolAddress = null, retries = PR
       if (data.outAmount) {
         return Number(data.outAmount) / LAMPORTS_PER_SOL / (tokenAmount / 1e6);
       }
-return null;
+      return null;
     } catch (e) {
-      log('debug', `DexScreener fetch failed: ${e.message}`);
+      log('debug', `Jupiter quote price fetch failed: ${e.message}`);
       return null;
     }
   }
@@ -335,7 +336,11 @@ static async _getDexScreenerData(tokenMint) {
 
   static async _getPriceFromDexScreener(tokenMint) {
     const data = await PoolService._getDexScreenerData(tokenMint);
-    return data?.priceNative || null;
+    if (data?.priceNative > 0) return data.priceNative;
+    if (data?.priceUSD > 0 && CONFIG.SOL_PRICE > 0) {
+      return data.priceUSD / CONFIG.SOL_PRICE;
+    }
+    return null;
   }
 
   static async _getPriceFromJupiter(tokenMint) {
@@ -444,8 +449,11 @@ static async _getDexScreenerData(tokenMint) {
 
   static _mergePrice(raydiumData, dexData, onchainData) {
     if (dexData?.priceNative > 0) return dexData.priceNative;
+    if (dexData?.priceUSD > 0 && CONFIG.SOL_PRICE > 0) {
+      return dexData.priceUSD / CONFIG.SOL_PRICE;
+    }
     if (raydiumData?.price) {
-      return parseFloat(raydiumData.price) / 140;
+      return parseFloat(raydiumData.price) / (CONFIG.SOL_PRICE || 140);
     }
     return null;
   }

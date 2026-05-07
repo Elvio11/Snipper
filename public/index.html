@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SniperBOT | Premium Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="glow-bg"></div>
+    
+    <nav class="navbar">
+        <div class="logo">
+            <span class="bolt">⚡</span> SNIPER<span class="bot-text">BOT</span>
+        </div>
+        <div class="status-badge" id="bot-status">
+            <span class="status-dot pulse"></span> LIVE MONITORING
+        </div>
+    </nav>
+
+    <main class="dashboard-grid">
+        <!-- Metric Cards -->
+        <div class="metrics-row">
+            <div class="metric-card gold">
+                <div class="metric-icon">💰</div>
+                <div class="metric-content">
+                    <span class="metric-label">TOTAL P&L</span>
+                    <span class="metric-value" id="total-pnl">+0.00 SOL</span>
+                </div>
+            </div>
+            <div class="metric-card blue">
+                <div class="metric-icon">🎯</div>
+                <div class="metric-content">
+                    <span class="metric-label">WIN RATE</span>
+                    <span class="metric-value" id="win-rate">0%</span>
+                </div>
+            </div>
+            <div class="metric-card purple">
+                <div class="metric-icon">📊</div>
+                <div class="metric-content">
+                    <span class="metric-label">TOTAL TRADES</span>
+                    <span class="metric-value" id="total-trades">0</span>
+                </div>
+            </div>
+            <div class="metric-card green">
+                <div class="metric-icon">🔥</div>
+                <div class="metric-content">
+                    <span class="metric-label">ACTIVE POSITIONS</span>
+                    <span class="metric-value" id="active-count">0</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Middle Row: Wallet & Positions -->
+        <div class="main-content-row">
+            <section class="panel positions-panel">
+                <div class="panel-header">
+                    <div class="header-tabs">
+                        <button class="tab-btn active" data-tab="active">🚀 ACTIVE</button>
+                        <button class="tab-btn" data-tab="history">📜 HISTORY</button>
+                    </div>
+                    <div class="header-actions">
+                        <span class="refresh-time">Auto-updating...</span>
+                    </div>
+                </div>
+                <div class="table-container">
+                    <table id="positions-table">
+                        <thead>
+                            <tr>
+                                <th>TOKEN</th>
+                                <th>ENTRY</th>
+                                <th>CURRENT</th>
+                                <th>PNL</th>
+                                <th>STATUS</th>
+                            </tr>
+                        </thead>
+                        <tbody id="positions-body">
+                            <tr class="empty-state">
+                                <td colspan="5">No active positions. Monitoring market...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <section class="panel wallet-panel">
+                <div class="panel-header">
+                    <h2><span class="icon">💳</span> WALLET STATUS</h2>
+                </div>
+                <div class="wallet-cards">
+                    <div class="wallet-card">
+                        <span class="wallet-label">SIGNER</span>
+                        <span class="wallet-address" id="signer-addr">...</span>
+                        <span class="wallet-balance" id="signer-balance">0.00 SOL</span>
+                    </div>
+                    <div class="wallet-card">
+                        <span class="wallet-label">VAULT</span>
+                        <span class="wallet-address" id="vault-addr">...</span>
+                        <span class="wallet-balance" id="vault-balance">0.00 SOL</span>
+                    </div>
+                </div>
+                <div class="refill-history" id="refill-log">
+                    <h3>REFILL LOGS</h3>
+                    <div class="log-entries" id="refill-entries">
+                        <div class="empty-log">No recent refills</div>
+                    </div>
+                </div>
+            </section>
+        </div>
+
+        <!-- Bottom Row: Terminal Logs -->
+        <section class="panel terminal-panel">
+            <div class="panel-header">
+                <h2><span class="icon">📟</span> BOT TERMINAL</h2>
+                <div class="terminal-controls">
+                    <button id="clear-logs">CLEAR</button>
+                    <span class="log-count" id="log-count">0 logs</span>
+                </div>
+            </div>
+            <div class="terminal-body" id="terminal">
+                <div class="log-entry system">Initializing SniperBOT Dashboard v2.0...</div>
+                <div class="log-entry system">Connecting to WebSocket bridge...</div>
+            </div>
+        </section>
+    </main>
+
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>

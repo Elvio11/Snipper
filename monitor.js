@@ -30,6 +30,7 @@ export class PoolMonitor extends EventEmitter {
     this._pumpReconnect  = 2000;
     this._pumpLastCheck  = {};
     this._lastPoolEmit   = null;
+    this._solPriceTimer  = null;
   }
 
   pause()      { this._paused = true;  log('info', 'Pool monitor paused'); }
@@ -54,13 +55,21 @@ export class PoolMonitor extends EventEmitter {
     this._startMigrationAccountLayer();
     
     // Layer 3: DexScreener search for new pairs (enrichment/backup)
-    this._startPollLayer();
+    if (CONFIG.SCANNER_ENABLED) {
+      this._startPollLayer();
+    } else {
+      log('info', '[MON] DexScreener polling discovery is DISABLED (only Pump/Migration active)');
+    }
+
+    // Layer 4: Global SOL price updater (every 5 min)
+    this._startSolPriceLayer();
   }
 
   async stop() {
     this._running = false;
     clearInterval(this._pollTimer);
     clearInterval(this._pumpPingTimer);
+    clearInterval(this._solPriceTimer);
     if (this._pumpWs) { try { this._pumpWs.close(); } catch {} }
     // Remove onLogs listener
     if (this._migrationSubId) {
@@ -183,7 +192,7 @@ export class PoolMonitor extends EventEmitter {
     const dexPool = await this._fetchDexScreenerPool(tokenMint);
     poolId = dexPool?.poolId || `mig_${tokenMint.slice(0, 8)}`;
     
-    log('snipe', `[PUMP-MIG] 🚀 ${program.toUpperCase()} migration: ${tokenMint.slice(0,8)}... (pool: ${poolId.slice(0,8)}...)`);
+    log('snipe', `[PUMP-MIG] 🚀 ${program.toUpperCase()} migration: ${tokenMint} (pool: ${poolId})`);
     
     const pool = {
       signature,
@@ -291,6 +300,15 @@ export class PoolMonitor extends EventEmitter {
 
       log('snipe', `[PUMP] 🚀 MIGRATION: ${mint.slice(0,8)}... → ${poolId.slice(0,8)}... (mc: $${(data.marketCap/1000).toFixed(1)}k)`);
 
+      const liqUSD = this._calcPumpLiq(data);
+      const minInitialSOL = CONFIG.MIN_INITIAL_LIQUIDITY_SOL || 3.5;
+      const currentSOL = liqUSD / (CONFIG._solPrice || 145);
+
+      if (currentSOL < minInitialSOL) {
+        log('info', `[PUMP] Skipping migration: ${currentSOL.toFixed(2)} SOL < ${minInitialSOL} SOL threshold`);
+        return;
+      }
+
       const pool = {
         signature: 'mig_' + mint,
         poolId,
@@ -300,7 +318,7 @@ export class PoolMonitor extends EventEmitter {
         vaultA: data.tokenVaultA ?? null,
         vaultB: data.tokenVaultB ?? null,
         program: 'pump_migration',
-        liquidityUSD: this._calcPumpLiq(data),
+        liquidityUSD: liqUSD,
         timestamp: Date.now(),
         source: 'pumpportal',
         pumpData: data,
@@ -337,8 +355,8 @@ export class PoolMonitor extends EventEmitter {
 
   _calcPumpLiq(data) {
     const solReserve = parseFloat(data.virtualSolReserves ?? 0) / 1e9;
-    const price = parseFloat(data.marketCap ?? 0);
-    const liqUSD = solReserve * 150;
+    const solPrice = CONFIG._solPrice || 145;
+    const liqUSD = solReserve * solPrice;
     return liqUSD;
   }
 
@@ -440,5 +458,43 @@ export class PoolMonitor extends EventEmitter {
     log('info', `[MON] [${layer}] Pool detected: ${pool.tokenMint.slice(0,8)}... (liquidity: $${pool.liquidityUSD?.toFixed(0) || '?'})`);
     
     this.emit('newPool', pool);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SOL PRICE LAYER — Periodically update global SOL price for accuracy
+  // ═══════════════════════════════════════════════════════════════════════════
+  _startSolPriceLayer() {
+    const update = async () => {
+      try {
+        // Use a verified, high-liquidity SOL/USDC pair (Orca)
+        const SOL_USDC_PAIR = 'Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE';
+        const result = await dexService.getPairByAddress(SOL_USDC_PAIR);
+        
+        if (result.success && result.data?.[0]?.priceUsd) {
+          const price = parseFloat(result.data[0].priceUsd);
+          
+          // STRICT SANITY CHECK: SOL price must be within a reasonable range
+          if (price > 50 && price < 500) {
+            CONFIG._solPrice = price;
+            log('info', `[MON] Updated global SOL price: $${price.toFixed(2)}`);
+          } else {
+            log('warn', `[MON] SOL price from pair rejected ($${price.toFixed(2)}) — out of range`);
+          }
+        } else {
+          // Fallback to searching by SOL mint if pair lookup fails
+          const searchResult = await dexService.getTokenPrice(SOL_MINT);
+          if (searchResult.success && searchResult.data?.priceUSD > 50) { // Strict check
+            const price = searchResult.data.priceUSD;
+            CONFIG._solPrice = price;
+            log('info', `[MON] Updated global SOL price (fallback): $${price.toFixed(2)}`);
+          }
+        }
+      } catch (e) {
+        log('warn', `[MON] SOL price update failed: ${e.message}`);
+      }
+    };
+
+    update();
+    this._solPriceTimer = setInterval(update, 300_000); // 5 minutes
   }
 }

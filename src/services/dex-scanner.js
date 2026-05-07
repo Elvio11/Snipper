@@ -109,7 +109,7 @@ class DexScanner {
     if (!tokenMint || !poolAddress) return;
 
     if (this._positions && this._positions.get(tokenMint)) {
-      log('debug', `DexScanner: ${tokenMint.slice(0,8)} already in position`);
+      log('debug', `DexScanner: ${tokenMint} already in position`);
       return;
     }
 
@@ -118,23 +118,23 @@ class DexScanner {
 
     const tokenResult = await dexService.getTokenPairs(tokenMint);
     if (!tokenResult.success || !tokenResult.data?.length) {
-      log('debug', `DexScanner: validation failed for ${tokenMint.slice(0,8)}`);
+      log('debug', `DexScanner: validation failed for ${tokenMint}`);
       return;
     }
 
     const topPair = tokenResult.data[0];
     if ((topPair.liquidity?.usd || 0) < CONFIG.SCANNER_MIN_LIQUIDITY) {
-      log('debug', `DexScanner: liquidity check failed for ${tokenMint.slice(0,8)}`);
+      log('debug', `DexScanner: liquidity check failed for ${tokenMint}`);
       return;
     }
 
     const score = this._scoreCandidate(pair);
-    log('snipe', `DexScanner BUY signal: ${tokenMint.slice(0,8)}... score=${score}`);
+    log('snipe', `DexScanner BUY signal: ${tokenMint} score=${score}`);
 
     try {
       const result = await buyToken(tokenMint, CONFIG.BUY_AMOUNT_SOL, poolAddress);
       if (result.success) {
-        log('success', `DexScanner: BOUGHT ${tokenMint.slice(0,8)}...`);
+        log('success', `DexScanner: BOUGHT ${tokenMint}`);
       } else {
         log('warn', `DexScanner: buy failed: ${result.error}`);
       }

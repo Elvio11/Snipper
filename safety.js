@@ -4,6 +4,7 @@ import { getConnection, getWallet } from './wallet.js';
 import { CONFIG } from './config.js';
 import { log } from './logger.js';
 import { dexService } from './src/services/dexscreener-service.js';
+import { rugCheck } from './rugcheck.js';
 
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
@@ -37,11 +38,14 @@ export async function getTokenSecurityFromDexScreener(tokenMint) {
     const pair = result.data;
     return {
       liquidityUSD: pair.liquidityUSD || 0,
-      liquidityQuote: 0,
+      liquidityQuote: pair.liquidityQuote || 0,
+      quoteTokenSymbol: pair.quoteTokenSymbol || '',
+      quoteTokenAddress: pair.quoteTokenAddress || '',
       priceUSD: pair.priceUSD || 0,
+      priceSOL: pair.priceNative || 0, // DexScreener returns price in native quote asset (SOL) as priceNative
       txns24h: 0,
       volume24h: pair.volume24h || 0,
-      createdAt: null,
+      pairCreatedAt: pair.pairCreatedAt || 0,
       pairAddress: pair.pairAddress,
       tokenAddress: tokenMint,
     };
@@ -54,9 +58,10 @@ export async function getTokenSecurityFromDexScreener(tokenMint) {
  * Simplified safety analysis - focuses on available data from DexScreener
  * instead of trying to analyze extremely new tokens.
  */
-export async function analyzeToken(mintAddress) {
-  console.log('[SAFETY] Starting analysis for:', mintAddress.slice(0,8));
-  console.log('[SAFETY] HONEYPOT_CHECK enabled:', CONFIG.HONEYPOT_CHECK);
+export async function analyzeToken(mintAddress, poolInfo = null) {
+  console.log('[SAFETY] Starting analysis for:', mintAddress);
+  const minSolLiq = CONFIG.MIN_SOL_LIQUIDITY || 3.5;
+  let solPrice = CONFIG._solPrice || 145; 
   const reasons = [];
   let score = 100;
 
@@ -72,8 +77,29 @@ export async function analyzeToken(mintAddress) {
     const dexData = await withTimeout(getTokenSecurityFromDexScreener(mintAddress), 8000, 'DexScreener');
     
     if (dexData && dexData.liquidityUSD > 0) {
+      // dexData.priceUSD is the token price in USD
+      // dexData.priceSOL is the token price in SOL (priceNative)
+      // If we have both, we can derive a highly accurate SOL price: SOL = USD / priceSOL
+      if (dexData.priceUSD > 0 && dexData.priceSOL > 0) {
+        const derivedSolPrice = parseFloat(dexData.priceUSD) / parseFloat(dexData.priceSOL);
+        if (derivedSolPrice > 50 && derivedSolPrice < 500) { // Sanity check
+          solPrice = derivedSolPrice;
+          CONFIG._solPrice = solPrice; // Update global config
+        }
+      }
+      
+      log('info', `[SAFETY] Threshold: ${minSolLiq} SOL (~$${(minSolLiq * solPrice).toFixed(0)}) | SOL Price: $${solPrice.toFixed(2)}`);
       reasons.push(`✔ Token indexed on DexScreener`);
       reasons.push(`│ Liquidity: $${dexData.liquidityUSD.toLocaleString()}`);
+      
+      const tokenAgeMs = dexData.pairCreatedAt ? (Date.now() - dexData.pairCreatedAt) : 0;
+      const isEstablished = tokenAgeMs > (CONFIG.ESTABLISHED_TOKEN_AGE_MS || 3600000); // Default 1 hour
+      
+      if (isEstablished) {
+        reasons.push(`│ Age: ${(tokenAgeMs / 3600000).toFixed(1)} hours (Established)`);
+      } else if (tokenAgeMs > 0) {
+        reasons.push(`│ Age: ${(tokenAgeMs / 60000).toFixed(1)} minutes`);
+      }
       
       // Check liquidity is within range
       if (dexData.liquidityUSD < CONFIG.MIN_LIQUIDITY_USD) {
@@ -87,15 +113,45 @@ export async function analyzeToken(mintAddress) {
       }
       
       // Check for some transaction activity (not dead token)
-      if (dexData.txns24h < 5) {
+      const isMigration = poolInfo?.source === 'migration_onlogs' || poolInfo?.source === 'pumpportal';
+      if (dexData.txns24h < 5 && !isMigration) {
         reasons.push(`⚠ Very low txn activity (${dexData.txns24h} txns/24h)`);
         score -= 20;
+      } else if (isMigration) {
+        reasons.push(`✔ Migration grace period: bypassing activity check`);
       } else {
         reasons.push(`✔ ${dexData.txns24h} txns in last 24h`);
       }
     } else {
       reasons.push(`⚠ Token not found on DexScreener - may be too new`);
+      log('info', `[SAFETY] Threshold: ${minSolLiq} SOL (~$${(minSolLiq * solPrice).toFixed(0)}) | SOL Price: $${solPrice.toFixed(2)} (est)`);
     }
+
+    // ENFORCE 3.5 SOL LIQUIDITY THRESHOLD
+    // Case 1: PoolInfo from monitor (has liquidityUSD or pumpData)
+    let currentLiqUSD = dexData?.liquidityUSD || poolInfo?.liquidityUSD || 0;
+    
+    // Case 2: If PumpFun migration, use virtual reserves if available
+    if (poolInfo?.pumpData?.virtualSolReserves) {
+      const solReserves = parseFloat(poolInfo.pumpData.virtualSolReserves) / 1e9;
+      reasons.push(`[PUMP] Virtual SOL reserves: ${solReserves.toFixed(2)} SOL`);
+      if (solReserves > 0) currentLiqUSD = solReserves * solPrice;
+    }
+
+    let currentLiqSOL = 0;
+    if (dexData?.quoteTokenAddress === SOL_MINT && dexData.liquidityQuote > 0) {
+      currentLiqSOL = dexData.liquidityQuote;
+      reasons.push(`│ Direct SOL Liquidity: ${currentLiqSOL.toFixed(2)} SOL (from DexScreener)`);
+    } else {
+      currentLiqSOL = currentLiqUSD / solPrice;
+      reasons.push(`│ Derived SOL Liquidity: ${currentLiqSOL.toFixed(2)} SOL ($${currentLiqUSD.toFixed(0)} / $${solPrice.toFixed(0)})`);
+    }
+
+    if (currentLiqSOL < minSolLiq) {
+      reasons.push(`✖ Liquidity too low: ${currentLiqSOL.toFixed(2)} SOL < ${minSolLiq} SOL threshold`);
+      return { safe: false, reasons, score: 0 };
+    }
+    reasons.push(`✔ Liquidity passed: ${currentLiqSOL.toFixed(2)} SOL (threshold: ${minSolLiq})`);
 
     // Try to get mint info from chain (with timeout)
     const conn = getConnection();
@@ -133,46 +189,70 @@ export async function analyzeToken(mintAddress) {
       score -= 10;
     }
 
-    // Transaction Simulation - PRIMARY HONEYPOT CHECK (replaces quote-only check)
-    console.log('[SAFETY] Running transaction simulation...');
-    const simulation = await simulateSellTransaction(mintAddress);
-    console.log('[SAFETY] Simulation result:', JSON.stringify(simulation));
-    
-    if (simulation.isHoneypot === true) {
-      reasons.push(`✖ Honeypot detected via simulation: ${simulation.reason}`);
-      return { safe: false, reasons, score: 0 };
-    }
-    
-    // Handle unknown case - simulation.isHoneypot === null
-    if (simulation.isHoneypot === null) {
-      // If DexScreener has the token with good liquidity → allow
-      if (dexData && dexData.liquidityUSD > 0 && dexData.liquidityUSD >= CONFIG.MIN_LIQUIDITY_USD) {
-        reasons.push(`⚠ Simulation inconclusive but DexScreener shows $${dexData.liquidityUSD.toLocaleString()} liquidity - allowing`);
-      } else {
-        // No DexScreener data + failed simulation = block
-        reasons.push(`✖ Simulation failed: ${simulation.reason || 'unknown'} - blocking to save fees`);
+    // Transaction Simulation - HONEYPOT CHECK (Optional)
+    if (CONFIG.HONEYPOT_SIMULATION_ENABLED) {
+      console.log('[SAFETY] Running transaction simulation...');
+      const simulation = await simulateSellTransaction(mintAddress, 1000000, dexData);
+      console.log('[SAFETY] Simulation result:', JSON.stringify(simulation));
+      
+      if (simulation.isHoneypot === true) {
+        reasons.push(`✖ Honeypot detected via simulation: ${simulation.reason}`);
         return { safe: false, reasons, score: 0 };
       }
+      
+      if (simulation.isHoneypot === null) {
+        if (dexData && dexData.liquidityUSD > 0 && dexData.liquidityUSD >= CONFIG.MIN_LIQUIDITY_USD) {
+          reasons.push(`⚠ Simulation inconclusive but DexScreener shows $${dexData.liquidityUSD.toLocaleString()} liquidity - allowing`);
+        } else {
+          reasons.push(`✖ Simulation failed: ${simulation.reason || 'unknown'} - blocking to save fees`);
+          return { safe: false, reasons, score: 0 };
+        }
+      } else {
+        reasons.push(`✔ Transaction simulation passed`);
+      }
     } else {
-      reasons.push(`✔ Transaction simulation passed`);
+      reasons.push(`ℹ Honeypot simulation disabled (relying on RugCheck)`);
     }
 
-    // Additional RugCheck validation (optional backup)
-    const rugcheck = await checkRugCheck(mintAddress);
-    if (rugcheck) {
-      const minScore = CONFIG.RUGCHECK_MIN_SCORE || 500;
-      if (rugcheck.score > minScore) {
-        reasons.push(`✖ RugCheck high risk: score=${rugcheck.score} (threshold: ${minScore})`);
-        score -= 50;
+    // Tiered RugCheck validation using consolidated module
+    const rugReport = await rugCheck(mintAddress);
+    if (rugReport && rugReport.score !== null) {
+      const rugcheck = {
+        score: rugReport.score,
+        risks: rugReport.risks,
+        lpLockedPct: rugReport.lpLockedPct || 0
+      };
+      // TIERED THRESHOLD: Standard (e.g. 600), High-Liq Migration (>10 SOL) (e.g. 650)
+      let rugThreshold = CONFIG.RUGCHECK_TIER_STANDARD || 600;
+      if (currentLiqSOL > 10) {
+        rugThreshold = CONFIG.RUGCHECK_TIER_HIGH_LIQ || 650;
+        reasons.push(`[TIER] High-liquidity mode active (Threshold: ${rugThreshold})`);
+      } else {
+        reasons.push(`[TIER] Standard mode active (Threshold: ${rugThreshold})`);
+      }
+
+      const tokenAgeMs = dexData?.pairCreatedAt ? (Date.now() - dexData.pairCreatedAt) : 0;
+      const isEstablished = tokenAgeMs > (CONFIG.ESTABLISHED_TOKEN_AGE_MS || 3600000);
+
+      if (rugcheck.score > rugThreshold) {
+        // If established with high liquidity, don't penalize as harshly
+        if (isEstablished && (dexData?.liquidityUSD || 0) > 20000) {
+          reasons.push(`⚠ RugCheck high risk (${rugcheck.score}) but token is established - reduced penalty`);
+          score -= 20;
+        } else {
+          reasons.push(`✖ RugCheck high risk: score=${rugcheck.score} (threshold: ${rugThreshold})`);
+          score -= 50;
+        }
       } else if (rugcheck.risks.length > 0) {
-        reasons.push(`⚠ RugCheck risks: ${rugcheck.risks.slice(0, 3).join(', ')}`);
-        score -= rugcheck.risks.length * 10;
+        const riskPenalty = isEstablished ? 5 : 10;
+        reasons.push(`⚠ RugCheck risks: ${rugcheck.risks.slice(0, 3).map(r => r.name || r).join(', ')}`);
+        score -= rugcheck.risks.length * riskPenalty;
       } else {
         reasons.push(`✔ RugCheck: score=${rugcheck.score}, lpLocked=${rugcheck.lpLockedPct.toFixed(1)}%`);
       }
     }
 
-    const safe = score >= 40;
+    const safe = score >= (CONFIG.MIN_SAFETY_SCORE || 40);
     return { safe, reasons, score: Math.max(0, score), dexData };
 
   } catch (err) {
@@ -180,7 +260,7 @@ export async function analyzeToken(mintAddress) {
   }
 }
 
-async function simulateSellTransaction(tokenMint, amount = 100000) {
+async function simulateSellTransaction(tokenMint, amount = 1000000, dexData = null) {
   const conn = getConnection();
   const wallet = getWallet();
   const amountsToTry = [1000000]; // Single attempt with 1M lamports
@@ -243,9 +323,17 @@ async function simulateSellTransaction(tokenMint, amount = 100000) {
           const errStr = JSON.stringify(simResult.value.err);
           
           // 6025 (decimal) and 0x1789 (hex) both = honeypot - cannot sell
-          const isHoneypot = errStr.includes('6025') || 
-                             errStr.includes('0x1789') || 
-                             errStr.includes('"Custom":6025');
+          const is6025 = errStr.includes('6025') || errStr.includes('"Custom":6025');
+          const isHoneypot = is6025 || errStr.includes('0x1789');
+
+          // AGE OVERRIDE: If token is > 1 hour old, ignore 6025 (Bonding Curve Complete)
+          const tokenAgeMs = dexData?.pairCreatedAt ? (Date.now() - dexData.pairCreatedAt) : 0;
+          const isEstablished = tokenAgeMs > 3600000; // 1 hour
+
+          if (isEstablished && is6025) {
+            log('info', `[SAFETY] Detected 6025 on established token (${(tokenAgeMs / 3600000).toFixed(1)}h old) - bypass simulation block`);
+            return { isHoneypot: false, reason: 'Age override: 6025 on established token' };
+          }
           
           if (isHoneypot) {
             log('warn', `Honeypot CONFIRMED via simulation: ${errStr}`);
@@ -323,43 +411,7 @@ async function simulateSellTransaction(tokenMint, amount = 100000) {
   return { isHoneypot: null, reason: `All checks failed: ${lastFailureReason}` };
 }
 
-async function checkRugCheck(tokenMint) {
-  const apiKey = process.env.RUGCHECK_API_KEY;
-  // Proceed even if no API key is provided since the endpoint has a free tier
-
-  try {
-    const headers = {};
-    if (apiKey) headers['x-api-key'] = apiKey;
-
-    const response = await fetch(
-      `https://api.rugcheck.xyz/v1/tokens/${tokenMint}/report/summary`,
-      {
-        headers,
-        signal: AbortSignal.timeout(8000),
-      }
-    );
-
-    if (!response.ok) {
-      log('warn', `RugCheck API error: ${response.status}`);
-      return null;
-    }
-
-    const data = await response.json();
-    log('info', `RugCheck: score=${data.score}, risks=${data.risks?.length || 0}, lpLocked=${data.lpLockedPct?.toFixed(1) || 0}%`);
-
-    return {
-      score: data.score || 0,
-      risks: data.risks || [],
-      lpLockedPct: data.lpLockedPct || 0,
-      tokenProgram: data.tokenProgram,
-    };
-  } catch (err) {
-    log('warn', `RugCheck error: ${err.message}`);
-    return null;
-  }
-}
-
-export { simulateSellTransaction, checkRugCheck };
+export { simulateSellTransaction };
 
 export async function getLPBurnPercent(poolId) {
   try {

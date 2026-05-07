@@ -6,6 +6,7 @@ import { log } from './logger.js';
 import { logTrade } from './trade-logger.js';
 
 import { getTokenPriceInSOL } from './price.js';
+import { dexService } from './src/services/dexscreener-service.js';
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const SWAP_V2_BASE = 'https://api.jup.ag/swap/v2';
@@ -21,7 +22,7 @@ async function jupiterV2Order(inputMint, outputMint, amount, taker, slippageBps 
   const params = new URLSearchParams({
     inputMint,
     outputMint,
-    amount: String(amount),
+    amount: String(Math.floor(amount)),
     taker,
   });
   if (CONFIG.MAX_PRIORITY_FEE_SOL > 0) {
@@ -218,7 +219,7 @@ export async function buyToken(mintAddress, solAmount = CONFIG.BUY_AMOUNT_SOL, p
           }
         }
 
-        return { success: true, txid, tokenAmount, pricePerToken, solSpent: solAmount };
+        return { success: true, txid, tokenAmount, pricePerToken, solSpent: solAmount, decimals };
 
       } catch (v1Err) {
         log('warn', `V1-BUY failed: ${v1Err.message}, falling back to V2...`);
@@ -266,7 +267,7 @@ export async function buyToken(mintAddress, solAmount = CONFIG.BUY_AMOUNT_SOL, p
         pricePerToken, txid,
       });
 
-      return { success: true, txid, tokenAmount, pricePerToken, solSpent: solAmount };
+      return { success: true, txid, tokenAmount, pricePerToken, solSpent: solAmount, decimals };
 
     } catch (err) {
       lastError = err;
@@ -403,6 +404,7 @@ export async function sellToken(mintAddress, tokenAmount, slippageBps = null, re
       const signedTxRaw = tx.serialize();
 
       let txid;
+      let actualSOL = solReceived;
       if (CONFIG.USE_MANAGED_LANDING) {
         const signedTxBase64 = Buffer.from(signedTxRaw).toString('base64');
         const result = await jupiterV2Execute(signedTxBase64, order.requestId);
@@ -410,12 +412,12 @@ export async function sellToken(mintAddress, tokenAmount, slippageBps = null, re
           throw new Error(`Jupiter /execute sell failed: code=${result.code} ${result.error || ''}`);
         }
         txid = result.signature;
+        actualSOL = Number(result.outputAmountResult) / LAMPORTS_PER_SOL || solReceived;
       } else {
         log('info', `[V2] Manual sell broadcast (cap: ${CONFIG.MAX_PRIORITY_FEE_SOL} SOL)...`);
         txid = await conn.sendRawTransaction(signedTxRaw, { skipPreflight: true, maxRetries: 2 });
         await conn.confirmTransaction(txid, 'confirmed');
       }
-      const actualSOL = Number(result.outputAmountResult) / LAMPORTS_PER_SOL || solReceived;
 
       log('success', `SELL confirmed [V2]: ${actualSOL.toFixed(6)} SOL received (tx: ${txid.slice(0,8)}...)`);
       logTrade({
@@ -509,11 +511,7 @@ async function getQuote(inputMint, outputMint, amount, liquidityUSD = 0) {
 export function calculateDynamicSlippage(liquidityUSD) {
   let slippage = CONFIG.SLIPPAGE_PERCENT || 10;
   
-  if (liquidityUSD < 1000)        slippage = Math.max(slippage, 30);
-  else if (liquidityUSD < 5000)   slippage = Math.max(slippage, 25);
-  else if (liquidityUSD < 20000)  slippage = Math.max(slippage, 20);
-  else if (liquidityUSD < 100000) slippage = Math.max(slippage, 15);
-  else if (liquidityUSD < 1000000) slippage = Math.max(slippage, 10);
+  if (liquidityUSD < 1000000) slippage = Math.max(slippage, 10);
   else if (liquidityUSD < 10000000) slippage = Math.max(slippage, 5);
   else slippage = Math.max(slippage, 2);
   
@@ -521,130 +519,126 @@ export function calculateDynamicSlippage(liquidityUSD) {
 }
 
 // ─── Paper trading ───────────────────────────────────────────────────────────
+const PAPER_FEE_SOL = 0.0005; // Simulate priority fee + Jito tip
 
-import { PoolService } from './src/services/pool.js';
-
-const PAPER_PRICES = new Map(); // mintAddress → entry price in SOL
+const PAPER_DATA = new Map(); // mintAddress → { entryPrice, decimals }
 
 async function getEntryPrice(inputMint, outputMint, amount, poolAddress = null) {
-  const lamports = Math.floor(amount * 1e9);
-  
-  // 1. Try Jupiter quote API (V2)
+  // Priority 1: price.js (Same source as monitor loop to ensure ROI consistency)
   try {
-    const params = new URLSearchParams({
-      inputMint,
-      outputMint,
-      amount: lamports.toString(),
-      slippageBps: '1000'
-    });
-
-    const headers = { 'Accept': 'application/json' };
-    if (CONFIG.JUPITER_API_KEY) headers['x-api-key'] = CONFIG.JUPITER_API_KEY;
-
-    const res = await fetch(`${SWAP_V2_BASE}/order?${params}`, {
-      headers,
-      signal: AbortSignal.timeout(5000),
-    });
-
-    if (res.ok) {
-      const data = await res.json();
-      if (!data.error && data.outAmount) {
-        // Jupiter returns decimals dynamically, but we estimate using raw amount
-        const tokenAmountRaw = Number(data.outAmount);
-        
-        // Wait, to calculate exact price we need decimals. 
-        // We'll just calculate price in lamports per raw token, or try fallback if it's too complex.
-        // Actually, fallback to DexScreener is much more reliable for price mapping.
-        // Let's just use getTokenPriceInSOL for Jupiter V3 price API integration directly:
-        const jupPrice = await getTokenPriceInSOL(outputMint, poolAddress);
-        if (jupPrice) {
-          log('debug', `Entry price from TokenPrice API: ${jupPrice.toExponential(3)} SOL`);
-          return jupPrice;
-        }
-      }
-    }
-  } catch (e) {
-    log('debug', `Jupiter quote failed: ${e.message}`);
-  }
-  
-  // 2. Try DexScreener price (via price.js getTokenPriceInSOL)
-  try {
-    const price = await getTokenPriceInSOL(outputMint, poolAddress);
-    if (price && price > 0 && price < 100) {
-      log('debug', `Entry price from DexScreener: ${price.toExponential(3)} SOL`);
+    const price = await getTokenPriceInSOL(outputMint);
+    if (price && price > 0) {
+      log('debug', `Entry price from Monitor Engine: ${price.toExponential(3)} SOL`);
       return price;
     }
-  } catch (e) {
-    log('debug', `DexScreener price failed: ${e.message}`);
-  }
-  
-  // 3. No API price - use estimated fallback (for sniping very new tokens)
-  const estimatedPrice = 0.000001;
-  log('warn', `No API price for ${outputMint.slice(0,8)}... - using estimated ${estimatedPrice} SOL`);
-  return estimatedPrice;
+  } catch (e) {}
+
+  // Priority 2: DexScreener price (Fallback)
+  try {
+    const dexResult = await dexService.getTokenPrice(outputMint);
+    if (dexResult.success && dexResult.data) {
+      if (dexResult.data.priceNative > 0 && (dexResult.data.quoteAddress === SOL_MINT || dexResult.data.quoteToken === 'SOL')) {
+        return dexResult.data.priceNative;
+      }
+      if (dexResult.data.priceUSD > 0 && CONFIG.SOL_PRICE > 0) {
+        return dexResult.data.priceUSD / CONFIG.SOL_PRICE;
+      }
+    }
+  } catch (e) {}
+
+  // Priority 3: Fallback for new tokens (Sniping)
+  log('debug', `No market price for ${outputMint} - using sniping fallback: 1e-6 SOL`);
+  return 0.000001;
 }
 
-async function paperBuy(mintAddress, solAmount, poolAddress = null) {
-  const pricePerToken = await getEntryPrice(SOL_MINT, mintAddress, solAmount, poolAddress);
+async function paperBuy(mint, solAmount, poolAddress = null) {
+  const pricePerToken = await getEntryPrice(SOL_MINT, mint, solAmount, poolAddress);
   
   if (!pricePerToken) {
     return { success: false, error: 'No valid price - all sources failed' };
   }
   
+  // Fetch actual decimals
+  let decimals = 6;
+  try {
+    const conn = getConnection();
+    const info = await conn.getParsedAccountInfo(new PublicKey(mint));
+    if (info.value?.data?.parsed?.info?.decimals !== undefined) {
+      decimals = info.value.data.parsed.info.decimals;
+    }
+  } catch (e) {
+    log('debug', `Failed to fetch decimals for ${mint}: ${e.message}`);
+  }
+
   // Simulate slippage impact: reduce received tokens by slippage %
   const slippagePercent = CONFIG.SLIPPAGE_PERCENT || 10;
   const slippageFactor = 1 - (slippagePercent / 100);
-  const tokenAmount = Math.floor((solAmount / pricePerToken) * 1e6 * slippageFactor);
   
-  PAPER_PRICES.set(mintAddress, pricePerToken);
-  // Track paper balance: deduct buy amount from signer
-  paperDeductSigner(solAmount);
-  // Signer → Vault: transfer excess back to vault (keep 0.006 SOL for gas)
+  // Replicate live fee deduction: Buy amount + Fee
+  const totalSpent = solAmount + PAPER_FEE_SOL;
+  const tokenAmount = Math.floor((solAmount / pricePerToken) * Math.pow(10, decimals) * slippageFactor);
+  
+  PAPER_DATA.set(mint, { entryPrice: pricePerToken, decimals });
+  
+  // Track paper balance: deduct total spent from signer
+  paperDeductSigner(totalSpent);
+  
+  // Simulate network delay (Live trading takes 1-3s for confirmation)
+  await new Promise(r => setTimeout(r, 1500));
+
+  // Signer → Vault: transfer excess back to vault (keep 0.05 SOL for gas in paper mode)
   const { getSOLBalance: getPaperSignerBal } = await import('./wallet.js');
   const signerBal = await getPaperSignerBal();
-  const keepForGas = 0.006;
+  const keepForGas = 0.05;
   const excessToVault = signerBal - keepForGas;
   if (excessToVault > 0.001) {
     paperTransferToVault(excessToVault);
-    log('info', `[PAPER] Signer → Vault: ${excessToVault.toFixed(4)} SOL (kept ${keepForGas} for gas)`);
   }
-  log('trade', `[PAPER BUY] ${solAmount} SOL of ${mintAddress.slice(0,8)}... @ ${pricePerToken.toExponential(3)} SOL/token (slippage: ${slippagePercent}%)`);
-  return { success: true, txid: 'buy_' + Date.now(), tokenAmount, pricePerToken, solSpent: solAmount };
+
+  log('trade', `[PAPER BUY] ${solAmount} SOL (+${PAPER_FEE_SOL} fee) of ${mint.slice(0,8)}... @ ${pricePerToken.toExponential(3)} SOL/token`);
+  return { success: true, txid: 'buy_' + Date.now(), tokenAmount, pricePerToken, solSpent: totalSpent, decimals };
 }
 
-async function paperSell(mintAddress, tokenAmount) {
-  let buyPrice = PAPER_PRICES.get(mintAddress);
+async function paperSell(mint, tokenAmount) {
+  let data = PAPER_DATA.get(mint);
   
-  // If no buy price in memory, try to get from position data
-  if (!buyPrice) {
-    buyPrice = await PoolService.getTokenPrice(mintAddress);
-    if (buyPrice) buyPrice = buyPrice * 1.5; // Assume bought 50% higher
+  // If no buy data in memory, try to recover
+  if (!data) {
+    let decimals = 6;
+    try {
+      const conn = getConnection();
+      const info = await conn.getParsedAccountInfo(new PublicKey(mint));
+      if (info.value?.data?.parsed?.info?.decimals !== undefined) {
+        decimals = info.value.data.parsed.info.decimals;
+      }
+    } catch (e) {}
+
+    let buyPrice = await getTokenPriceInSOL(mint);
+    if (!buyPrice) buyPrice = 0.001; // Conservative fallback for recovery
+    
+    data = { entryPrice: buyPrice, decimals };
   }
   
-  if (!buyPrice) {
-    // Use estimated price as fallback
-    buyPrice = 0.000001;
-    log('warn', `No buy price for ${mintAddress.slice(0,8)}... using estimated`);
-  }
+  const { entryPrice: buyPrice, decimals } = data;
   
-  // Get current market price via price.js
-  let currentPrice = null;
-  try {
-    currentPrice = await getTokenPriceInSOL(mintAddress);
-  } catch (e) {
-    // API failed
-  }
+  // Get current market price via high-fidelity Quote API (matches monitor loop)
+  let currentPrice = await getTokenPriceInSOL(mint, null, true, tokenAmount, decimals);
   
   // If no current price, use estimate based on buy price
   if (!currentPrice) {
-    // Assume 10% movement for estimation
     currentPrice = buyPrice * 1.10;
     log('warn', `No current price - using estimated ${currentPrice.toExponential(3)} SOL`);
   }
   
-  const solReceived = (tokenAmount / 1e6) * currentPrice;
-  const pnlPercent = ((solReceived - (buyPrice * tokenAmount / 1e6)) / (buyPrice * tokenAmount / 1e6)) * 100;
+  // Replicate live fee deduction on sell
+  const grossProceeds = (tokenAmount / Math.pow(10, decimals)) * currentPrice;
+  const solReceived = Math.max(0, grossProceeds - PAPER_FEE_SOL);
+  const solSpent = (tokenAmount / Math.pow(10, decimals)) * buyPrice;
+  const pnlPercent = ((solReceived - solSpent) / solSpent) * 100;
   const multiplier = currentPrice / buyPrice;
+  
+  // Simulate network delay
+  await new Promise(r => setTimeout(r, 1500));
   
   // Track paper balance: credit sell proceeds to signer, then transfer to vault
   paperCreditSigner(solReceived);
@@ -654,12 +648,13 @@ async function paperSell(mintAddress, tokenAmount) {
     paperTransferToVault(transferAmount);
   }
   
-  log('trade', `[PAPER SELL] ${(tokenAmount/1e6).toFixed(2)} tokens @ ${currentPrice.toExponential(3)} SOL/token = ${solReceived.toFixed(4)} SOL (${multiplier.toFixed(2)}x, ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(1)}%)`);
+  log('trade', `[PAPER SELL] ${(tokenAmount/Math.pow(10, decimals)).toFixed(2)} tokens @ ${currentPrice.toExponential(3)} SOL/token = ${solReceived.toFixed(4)} SOL (fee: ${PAPER_FEE_SOL})`);
   return { success: true, txid: 'sell_' + Date.now(), solReceived };
 }
 
 export function getPaperPrice(mintAddress) {
-  return PAPER_PRICES.get(mintAddress);
+  const data = PAPER_DATA.get(mintAddress);
+  return data ? data.entryPrice : null;
 }
 
 /**

@@ -15,6 +15,7 @@ A high-performance Solana sniper bot designed for micro-cap tokens on Raydium an
   - **Honeypot Simulation**: Verifies "sellability" via Jupiter quotes before buying.
   - **Contract Checks**: Mint authority, Freeze authority, and LP Burn verification.
 - **Dynamic Slippage**: Adjusts slippage based on network volatility and pool depth.
+- **Visual Dashboard**: Integrated React-based dashboard for real-time monitoring and trade management.
 
 ---
 
@@ -66,6 +67,13 @@ Or run directly:
 ```bash
 npm start
 ```
+
+### 5. Web Dashboard
+Monitor your bot visually:
+```bash
+npm run dashboard
+```
+Accessible at `http://localhost:3000`.
 
 ---
 

@@ -4,8 +4,9 @@ export const CONFIG = {
   // Dual-wallet security
   PRIVATE_KEY:               process.env.PRIVATE_KEY || '',
   SIGNER_PRIVATE_KEY:         process.env.SIGNER_PRIVATE_KEY || '',
-  SIGNER_MIN_BALANCE:         parseFloat(process.env.VAULT_MIN_BALANCE_SOL || '0.0174'),
-  SIGNER_REFILL_AMOUNT:       parseFloat(process.env.SIGNER_REFILL_AMOUNT || '0.0174'),
+  SIGNER_MIN_BALANCE:         parseFloat(process.env.SIGNER_MIN_BALANCE || '0.01'),
+  SIGNER_REFILL_AMOUNT:       parseFloat(process.env.SIGNER_REFILL_AMOUNT || '0.015'),
+  VAULT_MIN_BALANCE_SOL:      parseFloat(process.env.MIN_SOL_BALANCE || process.env.VAULT_MIN_BALANCE_SOL || '0.005'),
 
   // Telegram notifications
   TELEGRAM_BOT_TOKEN:        process.env.TELEGRAM_BOT_TOKEN || '',
@@ -16,15 +17,17 @@ export const CONFIG = {
   RPC_URL_FALLBACK:          process.env.RPC_URL_FALLBACK || 'https://api.mainnet-beta.solana.com',
   HELIUS_API_KEY:            process.env.HELIUS_API_KEY || '',
   JUPITER_API_KEY:           process.env.JUPITER_API_KEY || '',  // Optional: from developers.jup.ag/portal (keyless=0.5 RPS, free=1 RPS)
+  RUGCHECK_API_KEY:          process.env.RUGCHECK_API_KEY || '',
+
 
   // Trade controls
-  BUY_AMOUNT_SOL:            parseFloat(process.env.BUY_AMOUNT_SOL || '0.01'),
+  BUY_AMOUNT_SOL:            parseFloat(process.env.BUY_AMOUNT_SOL || '0.005'),
   TAKE_PROFIT_MULTIPLIER:    parseFloat(process.env.TAKE_PROFIT_MULTIPLIER || '1.35'),
-  STOP_LOSS_PERCENT:         parseFloat(process.env.STOP_LOSS_PERCENT || '15'),
-  SLIPPAGE_PERCENT:          parseFloat(process.env.SLIPPAGE_PERCENT || '10'),
+  STOP_LOSS_PERCENT:         parseFloat(process.env.STOP_LOSS_PERCENT || '20'),
+  SLIPPAGE_PERCENT:          parseFloat(process.env.SLIPPAGE || process.env.SLIPPAGE_PERCENT || '15'),
   MAX_POSITIONS:             parseInt(process.env.MAX_POSITIONS || '3'),
   USE_MANAGED_LANDING:       process.env.USE_MANAGED_LANDING !== 'false',
-  MAX_PRIORITY_FEE_SOL:      parseFloat(process.env.MAX_PRIORITY_FEE_SOL || '0.0001'),
+  MAX_PRIORITY_FEE_SOL:      parseFloat(process.env.PRIORITY_FEE || process.env.MAX_PRIORITY_FEE_SOL || '0.00001'),
   RETRY_ON_FAILURE:          process.env.RETRY_ON_FAILURE !== 'false',
   STRICT_DEDUPLICATION:      process.env.STRICT_DEDUPLICATION !== 'false',
 
@@ -46,7 +49,8 @@ export const CONFIG = {
   REQUIRE_MINT_REVOKED:      process.env.REQUIRE_MINT_REVOKED !== 'false',
   REQUIRE_FREEZE_REVOKED:    process.env.REQUIRE_FREEZE_REVOKED !== 'false',
   HONEYPOT_CHECK:            process.env.HONEYPOT_CHECK !== 'false',
-  MIN_SOL_LIQUIDITY:         parseFloat(process.env.MIN_SOL_LIQUIDITY || '0.5'), // 0.5 SOL minimum
+  MIN_SOL_LIQUIDITY:         parseFloat(process.env.MIN_SOL_LIQUIDITY || '3.5'), // 3.5 SOL minimum
+  HONEYPOT_SIMULATION_ENABLED: process.env.HONEYPOT_SIMULATION_ENABLED === 'true',
 
   // Dynamic slippage
   DYNAMIC_SLIPPAGE:         process.env.DYNAMIC_SLIPPAGE !== 'false',
@@ -87,7 +91,7 @@ export const CONFIG = {
       ],
 
   // DexScreener Scanner Config
-  SCANNER_ENABLED: process.env.SCANNER_ENABLED === 'true',
+  SCANNER_ENABLED: process.env.SCANNER_ENABLED === 'true', // Defaults to false per user request
   SCANNER_POLL_INTERVAL: parseInt(process.env.SCANNER_POLL_INTERVAL || '5000'),
   SCANNER_MIN_LIQUIDITY: parseFloat(process.env.SCANNER_MIN_LIQUIDITY || '50'),
   SCANNER_MIN_VOLUME: parseFloat(process.env.SCANNER_MIN_VOLUME || '20'),
@@ -95,6 +99,12 @@ export const CONFIG = {
   SCANNER_MAX_CANDIDATES: parseInt(process.env.SCANNER_MAX_CANDIDATES || '3'),
   SCANNER_SCORE_THRESHOLD: parseFloat(process.env.SCANNER_SCORE_THRESHOLD || '50'),
   RUGCHECK_MIN_SCORE:        parseInt(process.env.RUGCHECK_MIN_SCORE || '500'),
+  
+  // Advanced Safety Thresholds (replacing hardcoded values)
+  RUGCHECK_TIER_STANDARD:    parseInt(process.env.RUGCHECK_TIER_STANDARD || '600'),
+  RUGCHECK_TIER_HIGH_LIQ:    parseInt(process.env.RUGCHECK_TIER_HIGH_LIQ || '650'),
+  ESTABLISHED_TOKEN_AGE_MS:  parseInt(process.env.ESTABLISHED_TOKEN_AGE_MS || '3600000'), // 1 hour
+  MIN_SAFETY_SCORE:          parseInt(process.env.MIN_SAFETY_SCORE || '40'),
 };
 
 export function validateConfig() {

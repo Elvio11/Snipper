@@ -170,7 +170,7 @@ export class HeliusMonitor extends EventEmitter {
               log('info', 'Pool detected but scanning paused (positions open)');
               continue;
             }
-            log('info', `Pool parsed: ${poolInfo.tokenMint?.slice(0,12)}... ($${poolInfo.liquidityUSD?.toLocaleString() || '?'})`);
+            log('info', `Pool parsed: ${poolInfo.tokenMint} ($${poolInfo.liquidityUSD?.toLocaleString() || '?'})`);
             this.emit('newPool', poolInfo);
           }
         } catch (err) {

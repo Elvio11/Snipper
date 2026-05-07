@@ -8,15 +8,61 @@ const CACHE_TTL   = 5000;
 import { getConnection } from './wallet.js';
 import { PublicKey } from '@solana/web3.js';
 import { dexService } from './src/services/dexscreener-service.js';
+import { CONFIG } from './config.js';
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const JUPITER_PRICE_V3 = 'https://api.jup.ag/price/v3';
+const JUPITER_QUOTE_API = 'https://api.jup.ag/swap/v2/quote';
 
-export async function getTokenPriceInSOL(mintAddress, poolId = null) {
+/**
+ * Get the most accurate "executable" price using Jupiter's Quote API.
+ * This accounts for liquidity depth and price impact, mimicking real trading.
+ */
+async function getJupiterQuotePrice(mint, amount, decimals) {
+  try {
+    const params = new URLSearchParams({
+      inputMint: mint,
+      outputMint: SOL_MINT,
+      amount: String(Math.floor(amount)), 
+      slippageBps: '50', 
+    });
+    
+    const headers = { 'Accept': 'application/json' };
+    if (CONFIG.JUPITER_API_KEY) headers['x-api-key'] = CONFIG.JUPITER_API_KEY;
+
+    const res = await fetch(`${JUPITER_QUOTE_API}?${params}`, {
+      headers,
+      signal: AbortSignal.timeout(5000)
+    });
+    
+    if (!res.ok) return null;
+    
+    const json = await res.json();
+    const outAmount = json?.outAmount;
+    
+    if (outAmount && amount > 0) {
+      const solReceived = Number(outAmount) / 1e9;
+      const tokensSold = Number(amount) / Math.pow(10, decimals);
+      if (tokensSold === 0) return null;
+      return solReceived / tokensSold;
+    }
+  } catch (err) {
+  }
+  return null;
+}
+
+export async function getTokenPriceInSOL(mintAddress, poolId = null, forceRefresh = false, amount = null, decimals = 9) {
+  if (amount && Number(amount) > 0) {
+    const quotePrice = await getJupiterQuotePrice(mintAddress, amount, decimals);
+    if (quotePrice) return quotePrice;
+  }
+
   const cacheKey = poolId || mintAddress;
-  const cached = PRICE_CACHE.get(cacheKey);
-  if (cached && Date.now() - cached.ts < CACHE_TTL) {
-    return cached.price;
+  if (!forceRefresh) {
+    const cached = PRICE_CACHE.get(cacheKey);
+    if (cached && Date.now() - cached.ts < CACHE_TTL) {
+      return cached.price;
+    }
   }
 
   // 1. Primary: DexScreener - returns priceNative in SOL
@@ -26,7 +72,7 @@ export async function getTokenPriceInSOL(mintAddress, poolId = null) {
     return dexPrice;
   }
 
-  // 2. Secondary: Jupiter Price API v2 (replaced deprecated v6)
+  // 2. Secondary: Jupiter Price API v3
   const jupPrice = await getJupiterPriceInSOL(mintAddress);
   if (jupPrice) {
     PRICE_CACHE.set(cacheKey, { price: jupPrice, ts: Date.now() });
@@ -67,12 +113,14 @@ export async function getTokenPriceInSOL(mintAddress, poolId = null) {
  */
 async function getJupiterPriceInSOL(mintAddress) {
   try {
-    // Jupiter v2 supports vsToken parameter for direct SOL-denominated price
     const url = `${JUPITER_PRICE_V3}?ids=${mintAddress}&vsToken=${SOL_MINT}`;
     const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
-    const data = await res.json();
-    // V3 uses direct mint properties and usdPrice/price
-    const price = data?.[mintAddress]?.price || data?.[mintAddress]?.usdPrice;
+    const json = await res.json();
+    
+    // Jupiter v3 returns { data: { "MINT": { price: "..." } } }
+    const data = json?.data?.[mintAddress] || json?.[mintAddress];
+    const price = data?.price || data?.usdPrice;
+    
     if (price && price > 0) {
       return parseFloat(price);
     }
@@ -139,17 +187,39 @@ async function getPriceFromPoolRPC(poolId) {
         const baseVaultKey = new PublicKey(baseVault);
         const quoteVaultKey = new PublicKey(quoteVault);
         
-        const baseVaultInfo = await conn.getAccountInfo(baseVaultKey, { commitment: 'confirmed' });
-        const quoteVaultInfo = await conn.getAccountInfo(quoteVaultKey, { commitment: 'confirmed' });
+        const [baseVaultInfo, quoteVaultInfo] = await Promise.all([
+          conn.getAccountInfo(baseVaultKey, { commitment: 'confirmed' }),
+          conn.getAccountInfo(quoteVaultKey, { commitment: 'confirmed' })
+        ]);
         
         if (!baseVaultInfo?.data || !quoteVaultInfo?.data) continue;
         
         // Parse token account data (mint + amount at offset 0 and 64)
+        const baseMint = new PublicKey(baseVaultInfo.data.slice(0, 32)).toString();
+        const quoteMint = new PublicKey(quoteVaultInfo.data.slice(0, 32)).toString();
         const baseAmount = baseVaultInfo.data.readBigUInt64LE(64);
         const quoteAmount = quoteVaultInfo.data.readBigUInt64LE(64);
         
         if (baseAmount > 0n && quoteAmount > 0n) {
-          const price = Number(quoteAmount) / Number(baseAmount);
+          // Identify which side is SOL to calculate price in SOL
+          let price;
+          const [baseDec, quoteDec] = await Promise.all([
+            getMintDecimals(baseMint),
+            getMintDecimals(quoteMint)
+          ]);
+
+          const baseNorm = Number(baseAmount) / Math.pow(10, baseDec);
+          const quoteNorm = Number(quoteAmount) / Math.pow(10, quoteDec);
+
+          if (quoteMint === SOL_MINT) {
+            price = quoteNorm / baseNorm;
+          } else if (baseMint === SOL_MINT) {
+            price = baseNorm / quoteNorm;
+          } else {
+            // Fallback: assume quote is SOL if not explicitly known (dangerous but better than nothing)
+            price = quoteNorm / baseNorm;
+          }
+
           if (price > 0 && price < 1000000) {
             return price;
           }
@@ -217,8 +287,10 @@ export async function getCPMMPriceFromPool(poolId) {
           RAYDIUM_PROGRAM
         );
         
-        const vaultAInfo = await conn.getAccountInfo(vaultA, { commitment: 'confirmed' });
-        const vaultBInfo = await conn.getAccountInfo(vaultB, { commitment: 'confirmed' });
+        const [vaultAInfo, vaultBInfo] = await Promise.all([
+          conn.getAccountInfo(vaultA, { commitment: 'confirmed' }),
+          conn.getAccountInfo(vaultB, { commitment: 'confirmed' })
+        ]);
         
         if (!vaultAInfo?.data || !vaultBInfo?.data) continue;
         
@@ -229,12 +301,23 @@ export async function getCPMMPriceFromPool(poolId) {
         
         if (amountA === 0n || amountB === 0n) continue;
         
+        const [decA, decB] = await Promise.all([
+          getMintDecimals(mintA),
+          getMintDecimals(mintB)
+        ]);
+
+        const normA = Number(amountA) / Math.pow(10, decA);
+        const normB = Number(amountB) / Math.pow(10, decB);
+
         // Determine which token is SOL/USDC and calculate price
         let priceInSOL;
         if (mintA === SOL_MINT || mintA === 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v') {
-          priceInSOL = Number(amountB) / Number(amountA);
+          priceInSOL = normA / normB; // This was wrong too, should be SOL / Token
+          // Wait, if mintA is SOL, price in SOL is AmountSOL / AmountToken? 
+          // No, price of token in SOL is SOL_amount / Token_amount.
+          priceInSOL = normA / normB;
         } else if (mintB === SOL_MINT || mintB === 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v') {
-          priceInSOL = Number(amountA) / Number(amountB);
+          priceInSOL = normB / normA;
         } else {
           continue;
         }
@@ -283,9 +366,17 @@ async function getPriceFromRaydium(mintAddress) {
 async function getPriceFromDexscreener(mintAddress) {
   try {
     const result = await dexService.getTokenPrice(mintAddress);
-    if (result.success && result.data?.priceNative) {
-      const price = result.data.priceNative;
-      if (price > 0) {
+    if (result.success && result.data) {
+      // 1. Try native SOL price (verify it's quoted in SOL)
+      const isSolQuote = result.data.quoteAddress === SOL_MINT || result.data.quoteToken === 'SOL';
+      if (result.data.priceNative > 0 && isSolQuote) {
+        const price = result.data.priceNative;
+        PRICE_CACHE.set(mintAddress, { price, ts: Date.now() });
+        return price;
+      }
+      // 2. Try USD price fallback
+      if (result.data.priceUSD > 0 && CONFIG.SOL_PRICE > 0) {
+        const price = result.data.priceUSD / CONFIG.SOL_PRICE;
         PRICE_CACHE.set(mintAddress, { price, ts: Date.now() });
         return price;
       }
@@ -293,6 +384,25 @@ async function getPriceFromDexscreener(mintAddress) {
     return null;
   } catch {
     return null;
+  }
+}
+
+const DECIMAL_CACHE = new Map();
+
+async function getMintDecimals(mint) {
+  if (mint === SOL_MINT) return 9;
+  if (mint === 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v') return 6; // USDC
+  
+  if (DECIMAL_CACHE.has(mint)) return DECIMAL_CACHE.get(mint);
+
+  try {
+    const conn = getConnection();
+    const info = await conn.getParsedAccountInfo(new PublicKey(mint));
+    const decimals = info.value?.data?.parsed?.info?.decimals || 6;
+    DECIMAL_CACHE.set(mint, decimals);
+    return decimals;
+  } catch {
+    return 6;
   }
 }
 
